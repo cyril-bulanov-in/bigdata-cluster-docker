@@ -1,0 +1,362 @@
+# ============================================================================
+#  PLATFORM — step 1: a 4-node Apache Kafka cluster + Kafbat UI
+# ============================================================================
+#
+#  What docker compose is, in one sentence: a single file describing a set of
+#  containers that should run together. One command brings everything up,
+#  another tears it down. Every block below is commented line by line.
+#
+#  Start:  make up      (or docker compose -f docker-compose-platform.yml up -d)
+#  Stop:   make down
+#
+# ----------------------------------------------------------------------------
+#  Background you need in order to read this file
+# ----------------------------------------------------------------------------
+#
+#  KRaft. Kafka used to require ZooKeeper, a separate service that stored
+#  cluster metadata. As of Kafka 4.0 ZooKeeper is gone entirely — Kafka keeps
+#  metadata itself, in an internal log. The mechanism is called KRaft
+#  (Kafka Raft). That is where every CONTROLLER setting below comes from.
+#
+#  Each node can take two roles:
+#    * broker     — accepts and serves messages, stores partitions. The workhorse.
+#    * controller — takes part in leader elections and holds cluster metadata.
+#  Here nodes 1-3 combine both roles (combined mode) and node 4 is a plain
+#  broker. That gives controller fault tolerance without paying for a fourth
+#  controller that would add nothing.
+#
+#  About the quorum. Controllers decide by majority vote. A quorum of three
+#  survives the loss of one node, which is all a local cluster needs. Adding a
+#  fourth controller would not improve that — the majority would simply rise
+#  from 2 to 3. Node 4 is there purely to carry data, and quorum resilience is
+#  unaffected by it.
+#
+#  Three listeners on a broker. A listener answers "which port do I connect to".
+#  A broker does not just listen on a port, it also ADVERTISES the address
+#  clients should use to reach it. With a single address it can work either
+#  from inside the docker network or from your host machine, but not both.
+#  Hence three:
+#    * INTERNAL   (9092) — clients inside the docker network. Address: kafka-1:9092
+#    * EXTERNAL   (9094) — clients on the host.               Address: localhost:29091
+#    * CONTROLLER (9093) — internal KRaft traffic between controllers only
+#  The broker-only node (kafka-4) has no port 9093.
+#
+# ============================================================================
+
+# The compose project name. Containers are grouped under it in Docker Desktop
+# and in `docker compose ls`. Without it the directory name would be used.
+name: platform
+
+# ----------------------------------------------------------------------------
+#  Shared broker settings
+# ----------------------------------------------------------------------------
+#  x-* keys are "extensions": docker compose ignores them. They exist only so
+#  the same block of text is not copied four times.
+#  &kafka-common is an anchor — a label attached to a block.
+#  <<: *kafka-common splices that block in somewhere else.
+#  Anything set explicitly inside a service overrides what was spliced in.
+# ----------------------------------------------------------------------------
+x-kafka-common: &kafka-common
+  image: apache/kafka:${KAFKA_VERSION}
+
+  # unless-stopped — the container comes back after a host reboot or a crash,
+  # but stays down if you stopped it yourself.
+  restart: unless-stopped
+
+  networks: [dataplatform]
+
+  # Memory cap. Not a cure for an undersized machine — it is insurance against
+  # one broker eating everything and dragging the other three down with it.
+  deploy:
+    resources:
+      limits:
+        memory: ${KAFKA_MEM_LIMIT}
+
+  environment: &kafka-common-env
+    # ---- Cluster identity --------------------------------------------------
+    # The same UUID on all four nodes is what makes them one cluster rather
+    # than four strangers. Set in .env.
+    CLUSTER_ID: ${KAFKA_CLUSTER_ID}
+
+    # ---- Node roles --------------------------------------------------------
+    # Overridden to "broker" on kafka-4 further down.
+    KAFKA_PROCESS_ROLES: broker,controller
+
+    # Every controller, as nodeId@host:port. Identical on all nodes, including
+    # the broker-only one — brokers need to know who to ask for metadata.
+    # Exactly three entries: that is the quorum.
+    KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093
+    KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+    # ---- Listeners ---------------------------------------------------------
+    # Which ports to bind. 0.0.0.0 means every network interface of the container.
+    KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:9094
+
+    # Which protocol each listener speaks. PLAINTEXT means no encryption —
+    # fine for a local cluster, never expose that to a real network.
+    KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+
+    # Which listener brokers use to talk to each other.
+    KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+
+    # KAFKA_ADVERTISED_LISTENERS differs per node — see the services below.
+
+    # ---- Durability --------------------------------------------------------
+    # How many copies of each partition to keep. 3 out of 4 nodes: we survive
+    # losing one node without pausing writes, and two without losing data.
+    KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+
+    # How many replicas must acknowledge a write for it to count as successful
+    # (when the producer uses acks=all). 2 balances throughput against not
+    # losing data when a partition leader dies.
+    KAFKA_MIN_INSYNC_REPLICAS: 2
+
+    # Partition count for topics created without an explicit setting.
+    # A partition is the unit of parallelism: 6 partitions means up to
+    # 6 consumers reading in parallel.
+    KAFKA_NUM_PARTITIONS: 6
+
+    # Kafka's own internal topics need replication too, otherwise the cluster
+    # is pointless: lose the node holding consumer offsets and every consumer
+    # stalls.
+    KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+    KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+    KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+    KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 3
+    KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 2
+
+    # ---- Local-cluster behaviour -------------------------------------------
+    # Do not wait 3 seconds before starting a consumer group rebalance.
+    # The delay is useful in production (fewer needless rebalances); locally
+    # it only slows you down.
+    KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+    # How long messages are kept. 7 days is Kafka's own default, spelled out
+    # here so the knob is visible.
+    KAFKA_LOG_RETENTION_HOURS: 168
+
+    # Where data lives inside the container. This path is mounted onto a
+    # docker volume below so it outlives the container.
+    KAFKA_LOG_DIRS: /var/lib/kafka/data
+
+    # ---- JVM memory --------------------------------------------------------
+    # Kafka runs on the JVM. Left unbounded, the JVM claims a quarter of host
+    # memory — on a 128 GB machine that is 32 GB per broker.
+    KAFKA_HEAP_OPTS: ${KAFKA_HEAP_OPTS}
+
+    # ---- Metrics -----------------------------------------------------------
+    # JMX is the standard Java way of exposing metrics. Kafbat UI connects to
+    # this port and renders per-broker charts. The port is deliberately not
+    # published to the host — it is only needed inside the docker network.
+    KAFKA_JMX_PORT: 9999
+    # KAFKA_JMX_HOSTNAME differs per node — see below.
+
+  # Liveness probe. Docker runs this command inside the container every 15
+  # seconds; exit code 0 means healthy. It exists so that Kafbat UI and the
+  # init container do not start before the brokers are actually ready.
+  healthcheck:
+    test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+    interval: 15s
+    timeout: 10s
+    retries: 12
+    start_period: 30s   # failures during the first 30s do not count
+
+# ============================================================================
+#  SERVICES — the containers themselves
+# ============================================================================
+services:
+
+  # --------------------------------------------------------------------------
+  #  Node 1 — broker + controller
+  # --------------------------------------------------------------------------
+  kafka-1:
+    <<: *kafka-common                 # splice in the shared block
+    container_name: kafka-1           # fixed name, convenient for logs/exec
+    hostname: kafka-1                 # the name this node answers to inside the network
+    environment:
+      <<: *kafka-common-env           # splice in the shared variables
+      KAFKA_NODE_ID: 1                # unique node number within the cluster
+      # Addresses this broker advertises to clients:
+      #   from inside the network — by container name
+      #   from the host           — via localhost and the published port below
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-1:9092,EXTERNAL://localhost:29091
+      KAFKA_JMX_HOSTNAME: kafka-1
+    ports:
+      # "port_on_the_host:port_inside_the_container"
+      - "29091:9094"
+    volumes:
+      # named volume : path inside the container
+      # A volume outlives its container: recreate the container, data stays.
+      - kafka-1-data:/var/lib/kafka/data
+
+  # --------------------------------------------------------------------------
+  #  Node 2 — broker + controller
+  # --------------------------------------------------------------------------
+  kafka-2:
+    <<: *kafka-common
+    container_name: kafka-2
+    hostname: kafka-2
+    environment:
+      <<: *kafka-common-env
+      KAFKA_NODE_ID: 2
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-2:9092,EXTERNAL://localhost:29092
+      KAFKA_JMX_HOSTNAME: kafka-2
+    ports:
+      - "29092:9094"
+    volumes:
+      - kafka-2-data:/var/lib/kafka/data
+
+  # --------------------------------------------------------------------------
+  #  Node 3 — broker + controller
+  # --------------------------------------------------------------------------
+  kafka-3:
+    <<: *kafka-common
+    container_name: kafka-3
+    hostname: kafka-3
+    environment:
+      <<: *kafka-common-env
+      KAFKA_NODE_ID: 3
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-3:9092,EXTERNAL://localhost:29093
+      KAFKA_JMX_HOSTNAME: kafka-3
+    ports:
+      - "29093:9094"
+    volumes:
+      - kafka-3-data:/var/lib/kafka/data
+
+  # --------------------------------------------------------------------------
+  #  Node 4 — broker only
+  # --------------------------------------------------------------------------
+  #  Carries data but takes no part in elections. It still keeps
+  #  KAFKA_CONTROLLER_QUORUM_VOTERS and KAFKA_CONTROLLER_LISTENER_NAMES from
+  #  the shared block: a broker has to know which controllers to ask for
+  #  metadata, it just never votes.
+  # --------------------------------------------------------------------------
+  kafka-4:
+    <<: *kafka-common
+    container_name: kafka-4
+    hostname: kafka-4
+    environment:
+      <<: *kafka-common-env
+      KAFKA_NODE_ID: 4
+
+      # Override the role: broker only
+      KAFKA_PROCESS_ROLES: broker
+      # Drop the CONTROLLER listener — this node takes part in no elections
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:9094
+
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-4:9092,EXTERNAL://localhost:29094
+      KAFKA_JMX_HOSTNAME: kafka-4
+    ports:
+      - "29094:9094"
+    volumes:
+      - kafka-4-data:/var/lib/kafka/data
+
+  # --------------------------------------------------------------------------
+  #  One-shot initialisation: create the demo topic
+  # --------------------------------------------------------------------------
+  #  This container does its job and exits. It gives you something to look at
+  #  in the UI after the first start, and doubles as proof the cluster works.
+  #  --if-not-exists makes re-running it harmless.
+  # --------------------------------------------------------------------------
+  kafka-init:
+    image: apache/kafka:${KAFKA_VERSION}
+    container_name: kafka-init
+    networks: [dataplatform]
+    restart: "no"                     # do not restart: exiting is the point
+    depends_on:
+      # Wait until the brokers report healthy, not merely until their
+      # containers start. Without `condition`, depends_on is nearly useless.
+      kafka-1: { condition: service_healthy }
+      kafka-2: { condition: service_healthy }
+      kafka-3: { condition: service_healthy }
+      kafka-4: { condition: service_healthy }
+    command:
+      - /bin/bash
+      - -c
+      - |
+        set -e
+        BOOTSTRAP=kafka-1:9092,kafka-2:9092,kafka-3:9092,kafka-4:9092
+
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server "$$BOOTSTRAP" \
+          --create --if-not-exists \
+          --topic demo.events \
+          --partitions 6 \
+          --replication-factor 3
+
+        echo "--- topics in the cluster ---"
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server "$$BOOTSTRAP" --list
+
+        echo "--- cluster members ---"
+        /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server "$$BOOTSTRAP" \
+          | grep -E "^[a-z0-9.-]+:[0-9]+" || true
+
+  # --------------------------------------------------------------------------
+  #  Kafbat UI — web interface and cluster monitoring
+  # --------------------------------------------------------------------------
+  kafka-ui:
+    image: ghcr.io/kafbat/kafka-ui:${KAFBAT_VERSION}
+    container_name: kafka-ui
+    restart: unless-stopped
+    networks: [dataplatform]
+    ports:
+      - "${KAFBAT_PORT}:8080"
+    environment:
+      # Cluster label as shown in the interface.
+      # Index 0 because the UI can display several clusters at once.
+      KAFKA_CLUSTERS_0_NAME: local-4-node
+
+      # One address would be enough — the UI discovers the rest from the
+      # cluster itself. All four are listed so the UI still starts when a
+      # single node is down.
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka-1:9092,kafka-2:9092,kafka-3:9092,kafka-4:9092
+
+      # Pull metrics over JMX — this is what draws the per-broker load charts.
+      KAFKA_CLUSTERS_0_METRICS_TYPE: JMX
+      KAFKA_CLUSTERS_0_METRICS_PORT: 9999
+
+      # Allow changing things from the interface (creating topics and so on)
+      DYNAMIC_CONFIG_ENABLED: "true"
+
+      # Keep the UI's own logging at INFO so it does not flood the output
+      LOGGING_LEVEL_ROOT: INFO
+    depends_on:
+      kafka-1: { condition: service_healthy }
+      kafka-2: { condition: service_healthy }
+      kafka-3: { condition: service_healthy }
+      kafka-4: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health | grep -q UP || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+# ============================================================================
+#  NETWORK
+# ============================================================================
+#  Containers on the same docker network reach each other by service name:
+#  kafka-1 talks to kafka-2 at kafka-2:9092, no IP addresses involved.
+#
+#  `name: dataplatform` sets the real network name in docker (otherwise it
+#  would be platform_dataplatform). That matters later: the next stacks —
+#  object storage, orchestrator, jobs — will join this same network as
+#  an external one.
+# ============================================================================
+networks:
+  dataplatform:
+    name: dataplatform
+    driver: bridge
+
+# ============================================================================
+#  VOLUMES
+# ============================================================================
+#  A named volume is a slice of disk managed by docker itself.
+#  It outlives the container: `docker compose down` leaves it alone, only an
+#  explicit `docker compose down -v` removes it.
+#  Each broker gets its own — they must never write into the same directory.
+# ============================================================================
+volumes:
+  kafka-1-data:
+  kafka-2-data:
+  kafka-3-data:
+  kafka-4-data:
