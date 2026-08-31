@@ -1,0 +1,76 @@
+# Boots the Kafka stack on a clean runner and asserts it actually works.
+#
+# This is not a unit test — there is no application code in this stack. It is
+# an integration gate: if a change to the compose file breaks the cluster,
+# the pull request goes red before anyone pulls it.
+
+name: 01-kafka
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '01-kafka/**'
+      - '.github/workflows/01-kafka.yml'
+  pull_request:
+    paths:
+      - '01-kafka/**'
+      - '.github/workflows/01-kafka.yml'
+  workflow_dispatch:        # lets you run it by hand from the Actions tab
+
+# A new push cancels an in-flight run for the same branch. Booting four
+# brokers is not free; there is no point finishing a run that is already stale.
+concurrency:
+  group: 01-kafka-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    defaults:
+      run:
+        working-directory: 01-kafka
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show Docker versions
+        run: |
+          docker --version
+          docker compose version
+
+      # The runner has less memory than a workstation, so the heap and the
+      # per-container ceiling are lowered here. Everything else comes from
+      # .env.example unchanged — that file stays the single source of truth
+      # for image versions.
+      - name: Prepare .env for CI
+        run: |
+          cp .env.example .env
+          sed -i 's/^KAFKA_HEAP_OPTS=.*/KAFKA_HEAP_OPTS=-Xms256m -Xmx512m/' .env
+          sed -i 's/^KAFKA_MEM_LIMIT=.*/KAFKA_MEM_LIMIT=1g/' .env
+          cat .env
+
+      - name: Lint the compose file
+        run: make lint
+
+      - name: Start the cluster
+        run: make up
+
+      - name: Smoke test
+        run: make smoke
+
+      # Only runs when something above failed. Without this a red build tells
+      # you nothing beyond "it failed".
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== container status ==="
+          docker compose ps -a
+          echo "=== logs ==="
+          docker compose logs --no-color --tail=200
+
+      - name: Tear down
+        if: always()
+        run: make clean

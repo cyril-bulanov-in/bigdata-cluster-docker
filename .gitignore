@@ -1,12 +1,41 @@
-# Real variable values stay local
+# ---------------------------------------------------------------------------
+#  Repository-wide ignores.
+#  A pattern without a slash matches at any depth, so a single `.env` line
+#  covers 01-kafka/.env, 02-monitoring/.env and every stack added later.
+# ---------------------------------------------------------------------------
+
+# Real environment values — never committed. Each stack ships a .env.example.
 .env
-.DS_Store
+.env.local
+*.env.bak
+
+# Secrets and credentials
+*.pem
+*.key
+*.p12
+secrets/
+
+# Local state some stacks bind-mount instead of using named volumes
+data/
+logs/
 
 # macOS
 .DS_Store
+._*
 
-# Editors
+# Editors and IDEs
 .idea/
 .vscode/
 *.swp
-*.*~
+*~
+
+# Python (dbt, helper scripts)
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# dbt
+target/
+dbt_packages/
+.user.yml

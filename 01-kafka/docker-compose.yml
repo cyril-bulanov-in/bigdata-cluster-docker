@@ -6,7 +6,7 @@
 #  containers that should run together. One command brings everything up,
 #  another tears it down. Every block below is commented line by line.
 #
-#  Start:  make up      (or docker compose -f docker-compose-platform.yml up -d)
+#  Start:  make up      (or docker compose up -d)
 #  Stop:   make down
 #
 # ----------------------------------------------------------------------------
