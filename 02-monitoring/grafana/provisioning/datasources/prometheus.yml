@@ -1,0 +1,41 @@
+# ============================================================================
+#  Grafana datasource — the connection to Prometheus
+# ============================================================================
+#  Provisioning means Grafana reads this file on startup and creates the
+#  connection itself. Nothing to click, and the configuration lives in git
+#  rather than inside one person's browser.
+#
+#  This is the only provisioning file for now. Dashboards get their own
+#  directory and their own provider config in the next step.
+# ============================================================================
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+
+    type: prometheus
+
+    # A fixed uid rather than a generated one. Dashboards reference their
+    # datasource by uid, so if Grafana invents a random one, every dashboard
+    # file breaks the moment it is loaded on a fresh install. Pinning it now
+    # costs nothing and saves that later.
+    uid: prometheus
+
+    # proxy means the browser talks to Grafana and Grafana talks to Prometheus.
+    # The alternative, direct, would have the browser connect to Prometheus
+    # itself — which fails here, because `prometheus` is a container name that
+    # only resolves inside the docker network, not on your machine.
+    access: proxy
+    url: http://prometheus:9090
+
+    isDefault: true
+
+    # Not editable from the UI: this file is the source of truth. An edit made
+    # in the browser would be silently reverted on the next restart, which is
+    # more confusing than simply not allowing it.
+    editable: false
+
+    jsonData:
+      # Should match scrape_interval in prometheus.yml, so Grafana picks
+      # sensible step sizes when you zoom out.
+      timeInterval: 15s

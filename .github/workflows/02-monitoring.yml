@@ -1,0 +1,106 @@
+# Boots Kafka plus the whole monitoring stack on a clean runner and checks that
+# metrics are really being collected — not merely that the containers started.
+#
+# Triggered by changes to 01-kafka/ as well, because this stack includes that
+# one: a change to the Kafka compose file can break monitoring without touching
+# a single file in this directory.
+
+name: 02-monitoring
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '02-monitoring/**'
+      - '01-kafka/**'
+      - '.github/workflows/02-monitoring.yml'
+  pull_request:
+    paths:
+      - '02-monitoring/**'
+      - '01-kafka/**'
+      - '.github/workflows/02-monitoring.yml'
+  workflow_dispatch:        # lets you run it by hand from the Actions tab
+
+# A new push cancels an in-flight run for the same branch. Fourteen containers
+# is not a cheap run; there is no point finishing one that is already stale.
+concurrency:
+  group: 02-monitoring-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    # Longer than 01-kafka: fourteen containers, two image builds, and the
+    # smoke test waits up to four minutes for every target to come up.
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        working-directory: 02-monitoring
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Show Docker versions
+        run: |
+          docker --version
+          docker compose version
+
+      # cAdvisor needs the containerd socket, and the whole stack falls back to
+      # exporting nothing but the root cgroup without it. Confirming it exists
+      # here turns a puzzling smoke-test failure into an obvious one.
+      - name: Confirm the containerd socket is present
+        run: |
+          ls -l /run/containerd/containerd.sock
+
+      # Both .env files are needed: this stack includes 01-kafka, and the
+      # included file reads its own .env from its own directory.
+      - name: Prepare .env files for CI
+        run: |
+          cp .env.example .env
+          cp ../01-kafka/.env.example ../01-kafka/.env
+          # The runner has less memory than a workstation. Only the Kafka
+          # limits are lowered; every image version stays exactly as pinned,
+          # so CI tests the same versions you run locally.
+          #
+          # The container limit is set well above the heap on purpose. A JVM
+          # allocates plenty outside the heap, and a broker sitting at 90% of
+          # its limit would trip ContainerNearMemoryLimit — turning a healthy
+          # run red on a rule that is doing its job.
+          sed -i 's/^KAFKA_HEAP_OPTS=.*/KAFKA_HEAP_OPTS=-Xms256m -Xmx512m/' ../01-kafka/.env
+          sed -i 's/^KAFKA_MEM_LIMIT=.*/KAFKA_MEM_LIMIT=1500m/' ../01-kafka/.env
+          echo "--- 01-kafka/.env ---"; cat ../01-kafka/.env
+          echo "--- 02-monitoring/.env ---"; cat .env
+
+      - name: Validate compose, Prometheus config, rules and dashboard
+        run: make config
+
+      - name: Start Kafka and monitoring
+        run: make up
+
+      - name: Smoke test
+        run: make smoke
+
+      # Only runs when something above failed. Without this a red build tells
+      # you nothing beyond "it failed".
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== container status ==="
+          docker compose ps -a
+          echo ""
+          echo "=== scrape targets ==="
+          curl -fsS "http://localhost:9090/api/v1/targets?state=active" || true
+          echo ""
+          echo "=== alerts ==="
+          curl -fsS "http://localhost:9090/api/v1/alerts" || true
+          echo ""
+          echo "=== cadvisor: did the docker factory register? ==="
+          docker logs cadvisor 2>&1 | grep -i "factory" || true
+          echo ""
+          echo "=== logs ==="
+          docker compose logs --no-color --tail=150
+
+      - name: Tear down
+        if: always()
+        run: make clean

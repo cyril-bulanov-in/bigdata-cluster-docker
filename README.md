@@ -1,6 +1,7 @@
 # bigdata-cluster-docker
 
 [![01-kafka](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/01-kafka.yml/badge.svg?branch=main)](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/01-kafka.yml)
+[![02-monitoring](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/02-monitoring.yml/badge.svg?branch=main)](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/02-monitoring.yml)
 
 A working data platform, assembled with Docker Compose one component at a time.
 
@@ -108,8 +109,8 @@ touches the data itself.
 | Step | Stack | What gets built | State |
 |---|---|---|---|
 | 01 | [Kafka](01-kafka/) | 4-node KRaft cluster, 3-controller quorum, Kafbat UI, JMX metrics | done |
-| 02 | Monitoring | Prometheus, Grafana, JMX and node exporters, dashboards and alerts | next |
-| 03 | DBMS | PostgreSQL as an operational source, ClickHouse as the warehouse | planned |
+| 02 | [Monitoring](02-monitoring/) | Prometheus, Grafana, JMX / lag / host / container exporters, 12 alerting rules, provisioned dashboard | done |
+| 03 | DBMS | PostgreSQL as an operational source, ClickHouse as the warehouse | next |
 | 04 | ETL | Airflow, DAGs that launch containers rather than run code in-process | planned |
 | 05 | Spark | standalone master and workers, resource limits, a job image | planned |
 | 06 | dbt | staging and mart models on ClickHouse, tests, documentation | planned |
@@ -138,10 +139,11 @@ failing. Work out why a quorum of four controllers buys nothing over three.
 Each stack README ends with a failure drill of this kind.
 
 **The things that actually break in production.** Advertised listeners that work
-from inside a network but not outside it. Consumer lag under a slow sink.
-Timestamp and timezone handling across a Kafka to Parquet to ClickHouse hop.
-Idempotency of a pipeline re-run for the same day. Schema changes arriving from
-upstream without warning.
+from inside a network but not outside it. An exporter whose endpoint is green
+while it exports nothing usable. Consumer lag under a slow sink. Timestamp and
+timezone handling across a Kafka to Parquet to ClickHouse hop. Idempotency of a
+pipeline re-run for the same day. Schema changes arriving from upstream without
+warning.
 
 **Operational habits.** Pinned image versions, health checks that mean
 something, resource limits, credentials outside version control, one-command
@@ -155,18 +157,26 @@ turns into something you can discuss with a client.
 
 ## Getting started
 
-Each stack runs independently. To bring up the first one:
+Each stack runs independently, and the later ones pull in what they need.
 
 ```bash
 cd 01-kafka
 cp .env.example .env
 make up
+make test
 ```
 
-Stacks are designed to combine. Start 01 and 02 together and monitoring picks
-the brokers up on its own, because both attach to the same `dataplatform`
-network. There is no requirement to run everything at once — start what the task
-needs.
+Step 02 includes step 01, so starting it gives you the cluster and its
+monitoring together:
+
+```bash
+cd 02-monitoring
+cp .env.example .env
+make up
+make test
+```
+
+There is no requirement to run everything at once — start what the task needs.
 
 ---
 
@@ -192,15 +202,19 @@ bigdata-cluster-docker/
 These hold everywhere, so adding a stack never means learning new rules.
 
 **One shared network.** The first stack you start creates a bridge network
-called `dataplatform`; the rest join it as external. Containers reach each other
-by service name, never by IP address.
+called `dataplatform`; later stacks join it, either by `include` or as an
+external network. Containers reach each other by service name, never by IP
+address.
 
 **Nothing runs as `latest`.** Every image tag is pinned in `.env.example`. A
 floating tag eventually pulls an incompatible version and breaks a stack with no
-change on your side.
+change on your side. Where a project publishes no maintained image, the
+Dockerfile takes the artifact from its GitHub release and verifies it, rather
+than trusting a third-party rebuild.
 
 **Configuration through `.env`.** Secrets and machine-specific values stay out
-of the repository. Each stack ships a documented `.env.example` instead.
+of the repository. Each stack ships a documented `.env.example`, and `make up`
+refuses to start if the real file is missing.
 
 **Comments explain the why.** Compose files are written for someone who knows
 what a container is but has not memorised Kafka listener semantics or JVM heap
@@ -208,23 +222,23 @@ behaviour. Where a setting exists to avoid a specific failure, the comment says
 which one.
 
 **A `Makefile` per stack.** Standard targets everywhere: `up`, `down`, `clean`,
-`ps`, `logs`, `health`, `test`. Run `make` on its own for the full list,
-including helpers specific to that stack.
+`ps`, `logs`, `config`, `smoke`, `test`. Run `make` on its own for the full
+list, including helpers specific to that stack.
 
-**Every stack is verified in CI.** `make lint` validates the compose file and
-resolves every variable; `make smoke` asserts properties of the running stack
-that a successful start does not prove — node counts, replication, a message
-round trip. GitHub Actions runs both on every change to that stack, on a clean
-runner, from an empty state.
+**Every stack is verified in CI.** `make config` validates the compose file and
+every configuration it depends on; `make smoke` asserts properties of the
+running stack that a successful start does not prove — node counts, replication,
+metrics that are actually populated, a message round trip. GitHub Actions runs
+both on every change to that stack, on a clean runner, from an empty state.
 
 ---
 
 ## Requirements
 
 Docker Engine 24 or newer with Compose v2. Memory is the binding constraint:
-the Kafka stack alone wants roughly 8 GB available to Docker, and running
-several stacks together needs proportionally more. On Docker Desktop this is
-under Settings → Resources.
+the Kafka stack alone wants roughly 8 GB available to Docker, and running it
+together with monitoring needs more. On Docker Desktop this is under
+Settings → Resources.
 
 Images are multi-architecture, so the stacks run on both x86-64 and arm64
 (Apple Silicon, Raspberry Pi 5).

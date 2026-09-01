@@ -1,0 +1,42 @@
+# ============================================================================
+#  Grafana dashboard provider
+# ============================================================================
+#  Tells Grafana to load every dashboard JSON it finds in this directory.
+#  Drop a file in, and the dashboard appears — no import, no clicking.
+#
+#  This is the second half of provisioning. The first, in ../datasources,
+#  created the connection to Prometheus. Together they mean a fresh install
+#  comes up complete: `make clean && make up` and everything is back.
+# ============================================================================
+apiVersion: 1
+
+providers:
+  - name: platform
+
+    orgId: 1
+
+    # Dashboards appear inside a folder of this name in the Grafana sidebar.
+    # Worth having even with one dashboard: later stacks will add their own.
+    folder: Platform
+
+    type: file
+
+    # Re-read the directory on this interval, so editing a JSON file shows up
+    # without restarting the container. Handy while building a dashboard.
+    updateIntervalSeconds: 30
+
+    # Lets you edit and save a provisioned dashboard from the UI. The change
+    # goes into Grafana's database, not back into the file, so the file stays
+    # the source of truth on the next fresh install.
+    #
+    # The honest workflow: experiment in the UI, then export the JSON
+    # (Dashboard settings, JSON Model) and paste it back into the file.
+    # Otherwise the improvement lives only in one container's volume.
+    allowUiUpdates: true
+
+    options:
+      path: /etc/grafana/provisioning/dashboards
+      # false means every JSON lands in the folder named above. true would
+      # mirror the directory tree into Grafana folders — useful later, when
+      # there are dashboards per stack.
+      foldersFromFilesStructure: false

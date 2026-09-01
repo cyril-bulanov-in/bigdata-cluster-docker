@@ -1,0 +1,187 @@
+# ============================================================================
+#  Alerting rules
+# ============================================================================
+#  A rule is a PromQL expression plus a condition on how long it must hold.
+#  Prometheus evaluates all of them on every evaluation_interval and remembers
+#  which ones are currently true.
+#
+#  There is no Alertmanager in this stack yet, so nothing is emailed or paged.
+#  Firing alerts appear in the Prometheus UI under Alerts, and in `make alerts`.
+#  Routing and notification are a separate concern with their own container.
+#
+#  Three states a rule goes through:
+#    inactive  the expression returns nothing
+#    pending   it returned something, but not for long enough yet
+#    firing    it has held for the whole `for:` duration
+#
+#  `for:` is the part people skip, and it is what separates an alert from a
+#  noise generator: without it, a single slow scrape fires a critical alert.
+# ============================================================================
+
+groups:
+
+  # --------------------------------------------------------------------------
+  #  Targets
+  # --------------------------------------------------------------------------
+  - name: targets
+    rules:
+
+      # The single most valuable rule in any setup. `up` is synthetic:
+      # Prometheus writes 1 or 0 for every target after every scrape. This
+      # catches failures nobody anticipated, because it does not care what
+      # broke — only that something stopped answering.
+      - alert: TargetDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Target {{ $labels.job }} / {{ $labels.instance }} is not responding"
+          description: "Prometheus has failed to scrape this target for over a minute."
+
+  # --------------------------------------------------------------------------
+  #  Kafka
+  # --------------------------------------------------------------------------
+  - name: kafka
+    rules:
+
+      # Fewer brokers reporting than the cluster is designed to have.
+      # The expected count is written literally rather than derived from a
+      # metric: four is a property of the design, and deriving it from what is
+      # currently running would make the rule agree with reality by definition.
+      - alert: KafkaBrokerMissing
+        expr: count(up{job="kafka-jmx"} == 1) < 4
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Only {{ $value }} of 4 brokers are reporting"
+
+      # Partitions whose replicas have fallen behind. Writes still succeed, but
+      # the safety margin is gone: losing one more broker could lose data.
+      - alert: KafkaUnderReplicatedPartitions
+        expr: sum(kafka_server_replicamanager_underreplicatedpartitions) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} under-replicated partition(s)"
+          description: "Replication is behind. Check whether a broker is down or a disk is slow."
+
+      # Partitions with no leader at all. Producers and consumers are failing
+      # for those partitions right now, so the `for:` is short.
+      - alert: KafkaOfflinePartitions
+        expr: sum(kafka_controller_kafkacontroller_offlinepartitionscount) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value }} partition(s) have no leader"
+
+      # Exactly one node must be the active controller. Zero means the cluster
+      # cannot make metadata decisions; more than one means split brain.
+      # A controller election takes seconds, so 2m avoids firing during one.
+      - alert: KafkaControllerCountWrong
+        expr: sum(kafka_controller_kafkacontroller_activecontrollercount) != 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Active controller count is {{ $value }}, expected exactly 1"
+
+      # BrokerState 3 means RUNNING. Any other value that persists means a
+      # broker is stuck starting up, shutting down or recovering logs.
+      - alert: KafkaBrokerNotRunning
+        expr: kafka_server_brokerstate != 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Broker {{ $labels.broker }} is in state {{ $value }}, expected 3 (running)"
+
+  # --------------------------------------------------------------------------
+  #  Host
+  # --------------------------------------------------------------------------
+  - name: host
+    rules:
+
+      # Sustained CPU saturation. The `for:` is deliberately long: a busy
+      # minute during a rebalance or a compaction is normal, ten busy minutes
+      # are not.
+      - alert: HostHighCpu
+        expr: 100 - (avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Host CPU above 85% for 10 minutes (currently {{ $value | printf \"%.0f\" }}%)"
+
+      # MemAvailable, not MemFree. Free memory on Linux is almost always small
+      # because the kernel uses the rest as page cache — which Kafka depends on
+      # heavily. Available is what could actually be handed to a process.
+      - alert: HostLowMemory
+        expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes * 100 < 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Less than 10% memory available on the host"
+
+      # Kafka fills disks quietly and then stops accepting writes. Catching it
+      # at 15% free leaves time to react. tmpfs and overlay filesystems are
+      # excluded: they are not real disks and are always near full.
+      - alert: HostLowDisk
+        expr: |
+          node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"}
+            / node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs"} * 100 < 15
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Less than 15% free on {{ $labels.mountpoint }}"
+
+  # --------------------------------------------------------------------------
+  #  Containers  (these need cAdvisor)
+  # --------------------------------------------------------------------------
+  - name: containers
+    rules:
+
+      # A container approaching its memory limit is about to be killed by the
+      # kernel. Without this, an OOM kill looks like a random restart.
+      #
+      # The second half of the expression matters: containers with no limit
+      # report a spec limit of 0, and dividing by zero would make every
+      # unlimited container look infinitely over budget.
+      - alert: ContainerNearMemoryLimit
+        expr: |
+          container_memory_usage_bytes{name!=""}
+            / container_spec_memory_limit_bytes{name!=""} * 100 > 90
+          and container_spec_memory_limit_bytes{name!=""} > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Container {{ $labels.name }} is at {{ $value | printf \"%.0f\" }}% of its memory limit"
+
+      # CPU throttling. A container capped at half a core is not "slow", it is
+      # being deliberately paused by the kernel — a completely different
+      # problem from a busy host, and invisible in host CPU graphs.
+      - alert: ContainerCpuThrottled
+        expr: |
+          rate(container_cpu_cfs_throttled_seconds_total{name!=""}[5m]) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Container {{ $labels.name }} is being CPU throttled"
+
+      # Restart loops. A container that keeps coming back is not healthy just
+      # because it happens to be running when you look at it. container_start_time
+      # changes on every start, so counting changes counts restarts.
+      - alert: ContainerRestarting
+        expr: changes(container_start_time_seconds{name!=""}[15m]) > 2
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Container {{ $labels.name }} restarted more than twice in 15 minutes"

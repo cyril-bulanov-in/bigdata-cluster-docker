@@ -1,0 +1,73 @@
+# ============================================================================
+#  Which Kafka JMX beans to collect, and what to call them in Prometheus
+# ============================================================================
+#  Kafka exposes thousands of JMX beans. Collecting all of them makes scrapes
+#  slow and the metric names unusable, so this narrows the set to the ones that
+#  answer real questions and renames them into something readable.
+#
+#  Deliberately short for now. More beans can be added later; a small rule set
+#  is easier to verify against what actually shows up in Prometheus.
+#
+#  __JMX_TARGET__ is replaced at container startup by entrypoint.sh.
+# ============================================================================
+
+hostPort: __JMX_TARGET__
+
+# A broker that has just started has not registered all of its beans yet, and
+# an early scrape leaves gaps in the graphs.
+startDelaySeconds: 10
+
+lowercaseOutputName: true
+lowercaseOutputLabelNames: true
+
+# Only these bean families are read at all. Everything else is discarded before
+# a single rule is evaluated, which is what keeps the scrape cheap.
+includeObjectNames:
+  - "kafka.server:type=BrokerTopicMetrics,name=*"
+  - "kafka.server:type=ReplicaManager,name=*"
+  - "kafka.server:type=KafkaServer,name=BrokerState"
+  - "kafka.controller:type=KafkaController,name=*"
+  - "java.lang:type=Memory"
+
+rules:
+  # ---- Throughput, per topic where the bean carries one --------------------
+  # kafka.server<type=BrokerTopicMetrics, name=BytesInPerSec, topic=demo.events><>Count
+  #   becomes kafka_server_brokertopicmetrics_bytesinpersec_count{topic="demo.events"}
+  - pattern: 'kafka.server<type=BrokerTopicMetrics, name=(.+), topic=(.+)><>(Count|OneMinuteRate)'
+    name: kafka_server_brokertopicmetrics_$1_$3
+    labels:
+      topic: "$2"
+    type: GAUGE
+
+  # The same beans without a topic are the broker-wide totals
+  - pattern: 'kafka.server<type=BrokerTopicMetrics, name=(.+)><>(Count|OneMinuteRate)'
+    name: kafka_server_brokertopicmetrics_$1_$2
+    type: GAUGE
+
+  # ---- Replication health --------------------------------------------------
+  # underreplicatedpartitions above zero: a replica is not keeping up.
+  - pattern: 'kafka.server<type=ReplicaManager, name=(.+)><>Value'
+    name: kafka_server_replicamanager_$1
+    type: GAUGE
+
+  # ---- Controller ----------------------------------------------------------
+  # activecontrollercount is 1 on exactly one node. Summed across the cluster
+  # it must equal 1: zero means no controller, two means split brain.
+  - pattern: 'kafka.controller<type=KafkaController, name=(.+)><>Value'
+    name: kafka_controller_kafkacontroller_$1
+    type: GAUGE
+
+  # ---- Broker lifecycle ----------------------------------------------------
+  # 3 means RUNNING. Anything else, for more than a moment, is a problem.
+  - pattern: 'kafka.server<type=KafkaServer, name=BrokerState><>Value'
+    name: kafka_server_brokerstate
+    type: GAUGE
+
+  # ---- The broker's own JVM heap -------------------------------------------
+  - pattern: 'java.lang<type=Memory><HeapMemoryUsage>(used|max|committed)'
+    name: kafka_jvm_memory_heap_$1_bytes
+    type: GAUGE
+
+  # Anything that got this far and matched nothing above is dropped.
+  - pattern: ".*"
+    name: ""

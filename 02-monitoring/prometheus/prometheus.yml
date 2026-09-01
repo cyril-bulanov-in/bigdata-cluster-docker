@@ -1,0 +1,93 @@
+# ============================================================================
+#  Prometheus configuration
+# ============================================================================
+#  Five jobs: Prometheus itself, the JMX exporters in front of each broker, the
+#  host machine, the containers, and Kafka seen from the client side.
+#  Alerting rules live in their own file so this one stays readable.
+#
+#  After editing this file:  make reload   (no restart, no data loss)
+# ============================================================================
+
+global:
+  # How often each target is scraped. 15s is fine enough to see a spike and
+  # cheap enough that a laptop does not notice.
+  scrape_interval: 15s
+  # How often every alerting rule is re-evaluated. Keeping it equal to the
+  # scrape interval means a rule never runs twice on the same data point.
+  evaluation_interval: 15s
+
+  # Attached to every metric this server collects. Matters as soon as there is
+  # more than one Prometheus and their data ends up side by side.
+  external_labels:
+    cluster: local-platform
+
+# ----------------------------------------------------------------------------
+#  Alerting rules
+# ----------------------------------------------------------------------------
+#  A glob, so a new file dropped into the directory is picked up by
+#  `make reload` without touching this config.
+#
+#  There is no `alerting:` section pointing at an Alertmanager yet. Prometheus
+#  evaluates the rules and shows what is firing in its own UI; it simply has
+#  nowhere to send them. That is a deliberate gap, not an oversight.
+# ----------------------------------------------------------------------------
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+
+  # ---- Prometheus watching itself -----------------------------------------
+  # The cheapest proof that scraping works. localhost is correct here and only
+  # here: this target is inside the Prometheus container.
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # ---- Kafka internals, one exporter per broker ---------------------------
+  # Hostnames are container names on the dataplatform network. No IPs and no
+  # localhost: Prometheus runs in its own container, where localhost is itself.
+  #
+  # The `broker` label is added by hand so graphs and alerts can say "kafka-1"
+  # rather than "jmx-kafka-1:5556". Prometheus keeps the address in `instance`
+  # regardless, so nothing is lost.
+  - job_name: kafka-jmx
+    static_configs:
+      - targets: ['jmx-kafka-1:5556']
+        labels: { broker: kafka-1 }
+      - targets: ['jmx-kafka-2:5556']
+        labels: { broker: kafka-2 }
+      - targets: ['jmx-kafka-3:5556']
+        labels: { broker: kafka-3 }
+      - targets: ['jmx-kafka-4:5556']
+        labels: { broker: kafka-4 }
+
+  # ---- The host machine ----------------------------------------------------
+  # CPU, memory, disks, network, load average. One target, because there is one
+  # machine. On the Raspberry Pi cluster later there will be one per node.
+  - job_name: node
+    static_configs:
+      - targets: ['node-exporter:9100']
+        labels:
+          # Overrides the default instance label, which would otherwise be the
+          # container address. Useful the moment a second machine appears.
+          instance: docker-host
+
+  # ---- Individual containers ----------------------------------------------
+  # cAdvisor produces far more series than anything else here: several dozen
+  # per container, times every container running. A slower interval keeps the
+  # volume manageable without losing anything you would actually look at.
+  - job_name: cadvisor
+    scrape_interval: 30s
+    static_configs:
+      - targets: ['cadvisor:8080']
+
+  # ---- Kafka from the client side: offsets and consumer lag ---------------
+  # One target for the whole cluster, unlike the JMX exporters: this one speaks
+  # the Kafka protocol and asks the cluster as a whole rather than one JVM.
+  #
+  # Scraped less often on purpose. Every scrape makes the exporter query offsets
+  # for every partition of every topic, which is real work for the brokers.
+  - job_name: kafka-lag
+    scrape_interval: 30s
+    static_configs:
+      - targets: ['kafka-lag-exporter:9308']

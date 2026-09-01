@@ -1,0 +1,318 @@
+# ============================================================================
+#  PLATFORM — step 2: monitoring (complete)
+# ============================================================================
+#
+#  Prometheus collects, Grafana draws, four kinds of exporter translate.
+#  Everything is provisioned from files: on a fresh machine, `make up` brings
+#  up the cluster, the metrics, the alerting rules and the dashboard with no
+#  manual step in between.
+#
+#  Start:  make up      (or docker compose up -d)
+#  Stop:   make down
+#  Check:  make test
+#
+# ----------------------------------------------------------------------------
+#  How this file relates to step 1
+# ----------------------------------------------------------------------------
+#  `include` pulls the whole Kafka stack in rather than copying it. There is
+#  exactly one definition of Kafka in this repository, in 01-kafka.
+#
+#  Consequences worth knowing:
+#    * `make up` here starts Kafka AND monitoring. You do not need to start
+#      01-kafka separately first.
+#    * Both files declare `name: platform`, so this is the same Compose
+#      project. If Kafka is already running from 01-kafka, `up` here leaves it
+#      alone and only adds the monitoring containers.
+#    * The included file reads its variables from 01-kafka/.env, not from the
+#      .env in this directory. Both must exist; `make up` checks.
+#    * `make clean` here removes the Kafka volumes too, because they belong to
+#      the same project.
+# ----------------------------------------------------------------------------
+include:
+  - ../01-kafka/docker-compose.yml
+
+name: platform
+
+# ----------------------------------------------------------------------------
+#  Shared settings for the four JMX exporters
+# ----------------------------------------------------------------------------
+#  Kafka publishes its internals over JMX, a Java-specific protocol Prometheus
+#  cannot read. Each exporter opens a JMX connection to one broker and
+#  republishes the numbers as a plain HTTP endpoint.
+#
+#  One exporter per broker, because a JMX connection targets a single JVM.
+#  They differ only in which broker they point at, so everything else lives
+#  here. `&jmx-exporter` names this block; `<<: *jmx-exporter` pastes it in.
+# ----------------------------------------------------------------------------
+x-jmx-exporter: &jmx-exporter
+  build:
+    context: ./jmx-exporter
+    args:
+      JMX_EXPORTER_VERSION: ${JMX_EXPORTER_VERSION}
+  image: dataplatform/jmx-exporter:${JMX_EXPORTER_VERSION}
+  restart: unless-stopped
+  networks: [dataplatform]
+  # No ports published to the host: only Prometheus needs to reach these, and
+  # Prometheus is on the same network. They have no authentication either.
+  healthcheck:
+    test: ["CMD-SHELL", "wget -qO- http://localhost:5556/metrics >/dev/null 2>&1 || exit 1"]
+    interval: 20s
+    timeout: 10s
+    retries: 6
+    start_period: 30s
+
+services:
+
+  # ==========================================================================
+  #  Kafka internals over JMX — one exporter per broker
+  # ==========================================================================
+  jmx-kafka-1:
+    <<: *jmx-exporter
+    container_name: jmx-kafka-1
+    environment:
+      JMX_TARGET: kafka-1:9999      # substituted into the config at startup
+    depends_on:
+      kafka-1: { condition: service_healthy }
+
+  jmx-kafka-2:
+    <<: *jmx-exporter
+    container_name: jmx-kafka-2
+    environment:
+      JMX_TARGET: kafka-2:9999
+    depends_on:
+      kafka-2: { condition: service_healthy }
+
+  jmx-kafka-3:
+    <<: *jmx-exporter
+    container_name: jmx-kafka-3
+    environment:
+      JMX_TARGET: kafka-3:9999
+    depends_on:
+      kafka-3: { condition: service_healthy }
+
+  jmx-kafka-4:
+    <<: *jmx-exporter
+    container_name: jmx-kafka-4
+    environment:
+      JMX_TARGET: kafka-4:9999
+    depends_on:
+      kafka-4: { condition: service_healthy }
+
+  # ==========================================================================
+  #  kafka-lag-exporter — Kafka as a client sees it
+  # ==========================================================================
+  #  Connects as an ordinary Kafka client, asks for topic offsets and consumer
+  #  group positions, publishes the difference: consumer lag. One container for
+  #  the whole cluster — it questions the cluster, not a single JVM.
+  # ==========================================================================
+  kafka-lag-exporter:
+    image: danielqsj/kafka-exporter:${KAFKA_EXPORTER_VERSION}
+    container_name: kafka-lag-exporter
+    restart: unless-stopped
+    networks: [dataplatform]
+    command:
+      - '--kafka.server=kafka-1:9092'
+      - '--kafka.server=kafka-2:9092'
+      - '--kafka.server=kafka-3:9092'
+      - '--kafka.server=kafka-4:9092'
+      # Kafka 4.x speaks a newer protocol than the exporter assumes by default.
+      - '--kafka.version=3.6.0'
+    depends_on:
+      kafka-1: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9308/metrics >/dev/null 2>&1 || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 6
+      start_period: 20s
+
+  # ==========================================================================
+  #  node-exporter — metrics of the machine itself
+  # ==========================================================================
+  #  On Docker Desktop "the machine" is the Linux VM Docker runs containers
+  #  inside, not your laptop. On Linux and on a Raspberry Pi it is the hardware.
+  # ==========================================================================
+  node-exporter:
+    image: prom/node-exporter:${NODE_EXPORTER_VERSION}
+    container_name: node-exporter
+    restart: unless-stopped
+    networks: [dataplatform]
+    command:
+      # Without these the exporter reads its own /proc and /sys and reports
+      # on itself rather than on the machine.
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--path.rootfs=/rootfs'
+      # Otherwise every container overlay filesystem appears as a disk.
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc|rootfs/var/lib/docker)($$|/)'
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    pid: host
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9100/metrics >/dev/null 2>&1 || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 6
+      start_period: 15s
+
+  # ==========================================================================
+  #  cAdvisor — metrics for each container separately
+  # ==========================================================================
+  #  node-exporter answers "how loaded is the machine". cAdvisor answers "which
+  #  container is doing it", which is usually the question you actually have.
+  #  It also exposes memory limits and CPU throttling, without which an OOM
+  #  kill looks like a random restart.
+  #
+  #  Built from the GitHub release binary — see cadvisor/Dockerfile for why.
+  #
+  #  The privileges below each have a reason:
+  #    privileged        cgroup files of *other* containers are not readable
+  #                      by an ordinary container
+  #    /dev/kmsg         used to detect OOM kills as they happen
+  #    /:/rootfs         machine-level context: filesystems, uptime
+  #    /sys              where the cgroup accounting actually lives
+  #    docker.sock       the Docker API, for container metadata
+  #    containerd.sock   see the note below — this one is easy to miss
+  # ==========================================================================
+  cadvisor:
+    build:
+      context: ./cadvisor
+      args:
+        CADVISOR_VERSION: ${CADVISOR_VERSION}
+    image: dataplatform/cadvisor:${CADVISOR_VERSION}
+    container_name: cadvisor
+    restart: unless-stopped
+    networks: [dataplatform]
+    command:
+      - '--docker_only=true'
+      - '--housekeeping_interval=10s'
+      # Compose attaches half a dozen labels to every container; turning them
+      # into Prometheus labels is a lot of cardinality for nothing.
+      - '--store_container_labels=false'
+    privileged: true
+    devices:
+      - /dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /sys:/sys:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # ----------------------------------------------------------------------
+      #  Easy to miss, and the failure it causes looks like something else.
+      #
+      #  Docker has run containers through containerd for years, and modern
+      #  cAdvisor asks containerd for them, not the Docker daemon. Without this
+      #  socket its docker factory fails to register:
+      #
+      #    Registration of the docker container factory failed: unable to
+      #    create containerd client: dial unix /run/containerd/containerd.sock:
+      #    connect: no such file or directory
+      #
+      #  Only the Raw and systemd factories survive, and --docker_only then
+      #  discards everything they found, since nothing was recognised as a
+      #  Docker container. The visible symptom is not an error: /metrics
+      #  answers, the scrape target is green, several hundred container_*
+      #  metrics are exported — and every one of them is the root cgroup,
+      #  id="/". Any query filtering on name!="" comes back empty.
+      # ----------------------------------------------------------------------
+      - /run/containerd/containerd.sock:/run/containerd/containerd.sock:ro
+    ports:
+      # 8080 on the host is taken by Kafbat UI, hence a different port.
+      - "${CADVISOR_PORT}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/healthz >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ==========================================================================
+  #  Prometheus — collects, stores, and evaluates alerting rules
+  # ==========================================================================
+  prometheus:
+    image: prom/prometheus:${PROMETHEUS_VERSION}
+    container_name: prometheus
+    restart: unless-stopped
+    networks: [dataplatform]
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=${PROMETHEUS_RETENTION}'
+      # Lets `make reload` re-read the config and rules over HTTP. A restart
+      # also works but discards the in-memory block of recent data.
+      - '--web.enable-lifecycle'
+    volumes:
+      # A FILE: if ./prometheus/prometheus.yml does not exist, Docker silently
+      # creates a *directory* with that name and Prometheus dies with
+      # "is a directory".
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # A DIRECTORY, matching the glob in prometheus.yml.
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT}:9090"
+    healthcheck:
+      # wget is present in the Prometheus image; curl is not.
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9090/-/healthy >/dev/null 2>&1 || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 6
+      start_period: 20s
+
+  # ==========================================================================
+  #  Grafana — the query and graphing front end
+  # ==========================================================================
+  #  Grafana stores no metrics of its own. It asks Prometheus questions and
+  #  draws the answers, so it is disposable: delete the container and nothing
+  #  is lost, because both the connection and the dashboard come from files.
+  #
+  #  Note on the admin password: GF_SECURITY_ADMIN_PASSWORD only applies when
+  #  the account is created, on the first start with an empty grafana-data
+  #  volume. Editing .env afterwards changes nothing — the password then lives
+  #  in Grafana's own database. Reset it with:
+  #    docker compose exec grafana grafana cli admin reset-admin-password '<pw>'
+  # ==========================================================================
+  grafana:
+    image: grafana/grafana:${GRAFANA_VERSION}
+    container_name: grafana
+    restart: unless-stopped
+    networks: [dataplatform]
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      # Two provisioning directories, mounted separately rather than mounting
+      # the whole provisioning tree: the Grafana image ships other
+      # subdirectories there, and replacing all of them is a bigger change
+      # than this stack needs.
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      # Grafana's own database: users, preferences, anything created in the UI.
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "${GRAFANA_PORT}:3000"
+    depends_on:
+      prometheus: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health | grep -q '\"database\": *\"ok\"' || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 6
+      start_period: 30s
+
+# ----------------------------------------------------------------------------
+#  No `networks:` block here on purpose.
+#
+#  The dataplatform network is declared in 01-kafka/docker-compose.yml and
+#  arrives through `include`. Declaring it again — even identically — makes
+#  Compose report a resource name conflict, because `include` copies
+#  definitions rather than merging them.
+# ----------------------------------------------------------------------------
+
+volumes:
+  prometheus-data:
+  grafana-data:
