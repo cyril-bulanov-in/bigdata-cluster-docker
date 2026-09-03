@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<!--
+  ============================================================================
+   Macros for clickhouse-01 — shard 1, replica 1
+  ============================================================================
+   Macros are per-node substitutions used inside table definitions. They are
+   what makes a single CREATE TABLE ... ON CLUSTER statement produce a
+   different, correct table on every node:
+
+       CREATE TABLE events ON CLUSTER platform (...)
+       ENGINE = ReplicatedMergeTree(
+           '/clickhouse/tables/{shard}/events',   ... the path in Keeper
+           '{replica}'                            ... which replica this is
+       )
+
+   Two nodes whose {shard} is the same end up with the same Keeper path, and
+   that is precisely what makes them replicas of each other. Two nodes with
+   different {shard} values get different paths and never exchange data.
+
+   So replication is configured here, and sharding is configured in
+   config.d/10-cluster.xml. Getting these two out of step is the classic way
+   to build a cluster that looks right in `system.clusters` and silently fails
+   to replicate. `make ch-macros` prints what each node believes it is.
+
+   The replica name must be unique within a shard. Using the hostname makes it
+   obvious in `system.replicas` which machine a row refers to.
+  ============================================================================
+-->
+<clickhouse>
+    <macros>
+        <cluster>platform</cluster>
+        <shard>1</shard>
+        <replica>clickhouse-01</replica>
+    </macros>
+</clickhouse>

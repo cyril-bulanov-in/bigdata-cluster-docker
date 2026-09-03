@@ -1,0 +1,158 @@
+# ============================================================================
+#  Which Kafka Connect and Debezium JMX beans to collect
+# ============================================================================
+#  Connect exposes two families of beans that matter, and they answer
+#  different questions:
+#
+#    kafka.connect:*      the framework — are the tasks running, how fast are
+#                         records being produced, is the worker rebalancing
+#    debezium.postgres:*  the connector — is it still attached to the
+#                         replication slot, and how far behind the database is
+#
+#  The second one is the interesting half. A Connect task can sit in RUNNING
+#  while Debezium is minutes behind the write-ahead log, and only the Debezium
+#  beans show that.
+#
+#  __JMX_TARGET__ is replaced at container startup by entrypoint.sh.
+# ============================================================================
+
+hostPort: __JMX_TARGET__
+
+# Connect registers its connector beans only after the connector starts, which
+# can be a while after the worker itself is up.
+startDelaySeconds: 15
+
+lowercaseOutputName: true
+lowercaseOutputLabelNames: true
+
+includeObjectNames:
+  - "kafka.connect:type=connect-worker-metrics,*"
+  - "kafka.connect:type=connect-worker-rebalance-metrics"
+  - "kafka.connect:type=connector-task-metrics,*"
+  - "kafka.connect:type=source-task-metrics,*"
+  - "debezium.postgres:type=connector-metrics,*"
+  - "java.lang:type=Memory"
+
+rules:
+
+  # ---- Task health, per connector -----------------------------------------
+  #  The single most useful number here. A failed task means change capture
+  #  has stopped, and nothing else on the platform will notice: the topic
+  #  simply goes quiet, which is indistinguishable from an idle database.
+  #
+  #  Attribute names are written out one by one rather than captured with a
+  #  regex, because Connect's attributes contain dashes and a captured group
+  #  would produce metric names Prometheus rejects.
+  - pattern: 'kafka.connect<type=connect-worker-metrics, connector=(.+)><>connector-failed-task-count'
+    name: connect_connector_failed_tasks
+    labels:
+      connector: "$1"
+    type: GAUGE
+
+  - pattern: 'kafka.connect<type=connect-worker-metrics, connector=(.+)><>connector-running-task-count'
+    name: connect_connector_running_tasks
+    labels:
+      connector: "$1"
+    type: GAUGE
+
+  - pattern: 'kafka.connect<type=connect-worker-metrics, connector=(.+)><>connector-paused-task-count'
+    name: connect_connector_paused_tasks
+    labels:
+      connector: "$1"
+    type: GAUGE
+
+  # ---- Worker totals -------------------------------------------------------
+  - pattern: 'kafka.connect<type=connect-worker-metrics><>connector-count'
+    name: connect_worker_connectors
+    type: GAUGE
+
+  - pattern: 'kafka.connect<type=connect-worker-metrics><>task-count'
+    name: connect_worker_tasks
+    type: GAUGE
+
+  # ---- Rebalancing ---------------------------------------------------------
+  #  A worker that rebalances repeatedly is a worker that keeps dropping out
+  #  of its group. With one worker this should be flat at zero forever.
+  - pattern: 'kafka.connect<type=connect-worker-rebalance-metrics><>rebalancing'
+    name: connect_worker_rebalancing
+    type: GAUGE
+
+  - pattern: 'kafka.connect<type=connect-worker-rebalance-metrics><>completed-rebalances-total'
+    name: connect_worker_rebalances_total
+    type: COUNTER
+
+  # ---- Throughput ----------------------------------------------------------
+  - pattern: 'kafka.connect<type=source-task-metrics, connector=(.+), task=(.+)><>source-record-write-rate'
+    name: connect_source_record_write_rate
+    labels:
+      connector: "$1"
+      task: "$2"
+    type: GAUGE
+
+  - pattern: 'kafka.connect<type=source-task-metrics, connector=(.+), task=(.+)><>source-record-poll-rate'
+    name: connect_source_record_poll_rate
+    labels:
+      connector: "$1"
+      task: "$2"
+    type: GAUGE
+
+  # ---- Debezium: is capture actually keeping up ---------------------------
+  #  MilliSecondsBehindSource is the difference between the database clock and
+  #  the timestamp of the last event processed. This is the CDC equivalent of
+  #  consumer lag, and it is the number to watch.
+  - pattern: 'debezium.postgres<type=connector-metrics, context=(.+), server=(.+)><>MilliSecondsBehindSource'
+    name: debezium_milliseconds_behind_source
+    labels:
+      context: "$1"
+      server: "$2"
+    type: GAUGE
+
+  #  Connected is a boolean: is the connector still attached to the
+  #  replication slot. Zero here with a RUNNING task means Debezium is retrying
+  #  a connection it has lost.
+  - pattern: 'debezium.postgres<type=connector-metrics, context=(.+), server=(.+)><>Connected'
+    name: debezium_connected
+    labels:
+      context: "$1"
+      server: "$2"
+    type: GAUGE
+
+  #  The internal queue between the log reader and the Kafka producer. Falling
+  #  towards zero means Kafka is the bottleneck, not Postgres.
+  - pattern: 'debezium.postgres<type=connector-metrics, context=(.+), server=(.+)><>QueueRemainingCapacity'
+    name: debezium_queue_remaining_capacity
+    labels:
+      context: "$1"
+      server: "$2"
+    type: GAUGE
+
+  - pattern: 'debezium.postgres<type=connector-metrics, context=(.+), server=(.+)><>TotalNumberOfEventsSeen'
+    name: debezium_events_seen_total
+    labels:
+      context: "$1"
+      server: "$2"
+    type: COUNTER
+
+  - pattern: 'debezium.postgres<type=connector-metrics, context=(.+), server=(.+)><>NumberOfCommittedTransactions'
+    name: debezium_committed_transactions_total
+    labels:
+      context: "$1"
+      server: "$2"
+    type: COUNTER
+
+  #  Snapshot progress. Only meaningful during the initial load, but that is
+  #  exactly when you want to know whether it is moving.
+  - pattern: 'debezium.postgres<type=connector-metrics, context=snapshot, server=(.+)><>(SnapshotCompleted|SnapshotRunning)'
+    name: debezium_snapshot_$2
+    labels:
+      server: "$1"
+    type: GAUGE
+
+  # ---- The worker's own JVM ------------------------------------------------
+  - pattern: 'java.lang<type=Memory><HeapMemoryUsage>(used|max)'
+    name: connect_jvm_memory_heap_$1_bytes
+    type: GAUGE
+
+  # Anything that got this far and matched nothing above is dropped.
+  - pattern: ".*"
+    name: ""

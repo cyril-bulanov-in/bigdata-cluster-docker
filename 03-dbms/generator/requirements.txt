@@ -1,0 +1,2 @@
+# psycopg 3, binary build so no compiler is needed in the image
+psycopg[binary]==3.2.3

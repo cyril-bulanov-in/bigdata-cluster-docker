@@ -1,0 +1,113 @@
+<?xml version="1.0"?>
+<!--
+  ============================================================================
+   ClickHouse Keeper, node 1 of 3
+  ============================================================================
+   What Keeper is for. ReplicatedMergeTree is not self-sufficient: the data
+   lives on the ClickHouse nodes, but everything the replicas have to agree
+   about lives here. That is the replication log (which parts exist and who
+   still needs to fetch them), the election of a leader for merges, the
+   propagation of CREATE TABLE ... ON CLUSTER, and the hashes of inserted
+   blocks used for deduplication.
+
+   Keeper is a C++ reimplementation of ZooKeeper using Raft, built into the
+   ClickHouse project. Same protocol, no JVM. The move away from ZooKeeper
+   happened at roughly the same time as Kafka's move away from it, for the
+   same reasons.
+
+   Why three, and why separate containers.
+
+   Raft decides by majority, exactly like the KRaft controllers in 01-kafka:
+   three survive the loss of one, and four survive no more than three while
+   costing more. Hence three, and hence an odd number.
+
+   Keeper *can* run embedded inside clickhouse-server, but here it does not.
+   Mixing an embedded Keeper with standalone ones is a known way to produce a
+   cluster that half works. And Keeper is latency-sensitive: a heavy merge on
+   a co-located ClickHouse node delays its responses, and a slow Keeper stalls
+   merges and inserts across the whole cluster, not just on that node.
+
+   These three files are nearly identical. The only difference is server_id.
+   That duplication is deliberate: substituting an id from an environment
+   variable would be tidier right up until it silently resolved to nothing and
+   all three nodes claimed to be node zero.
+  ============================================================================
+-->
+<clickhouse>
+
+    <logger>
+        <level>information</level>
+        <!-- To the container log, where `docker logs` looks for it, rather
+             than to a file inside the container nobody will ever read. -->
+        <console>true</console>
+    </logger>
+
+    <!-- Without this Keeper binds to loopback only and the other two nodes
+         cannot reach it. Inside a container network that is always wrong. -->
+    <listen_host>0.0.0.0</listen_host>
+
+    <keeper_server>
+        <!-- Client port: this is what ClickHouse servers connect to. -->
+        <tcp_port>9181</tcp_port>
+
+        <!-- Unique per node. Must match the id in raft_configuration below. -->
+        <server_id>1</server_id>
+
+        <!-- Under /var/lib/clickhouse, which the image already creates and
+             owns as uid 101. A named volume mounted on a path the image does
+             not know about arrives owned by root, and Keeper cannot write. -->
+        <log_storage_path>/var/lib/clickhouse/coordination/log</log_storage_path>
+        <snapshot_storage_path>/var/lib/clickhouse/coordination/snapshots</snapshot_storage_path>
+
+        <coordination_settings>
+            <operation_timeout_ms>10000</operation_timeout_ms>
+            <!-- How long a ClickHouse server may vanish before Keeper drops
+                 its session. Thirty seconds survives a restart. -->
+            <session_timeout_ms>30000</session_timeout_ms>
+            <!-- Raft is chatty at info level and drowns everything else. -->
+            <raft_logs_level>warning</raft_logs_level>
+        </coordination_settings>
+
+        <!-- ================================================================
+             HTTP readiness endpoint
+             ================================================================
+             This is what the container healthcheck calls. It is worth using
+             rather than a plain port check, because it answers a stronger
+             question: not "is the process listening" but "has this node
+             joined the quorum and is it serving". A Keeper that is up but
+             cannot reach the other two is exactly the state a port check
+             would call healthy.
+
+             The image is Alpine-based, so it has busybox wget but no bash —
+             which rules out the usual /dev/tcp trick and makes an HTTP
+             endpoint the natural choice.
+        ================================================================ -->
+        <http_control>
+            <port>9182</port>
+            <readiness>
+                <endpoint>/ready</endpoint>
+            </readiness>
+        </http_control>
+
+        <!-- The quorum. Identical on all three nodes: this list is what they
+             agree the cluster consists of. Port 9234 is Raft traffic between
+             Keepers, distinct from the 9181 that clients use. -->
+        <raft_configuration>
+            <server><id>1</id><hostname>keeper-1</hostname><port>9234</port></server>
+            <server><id>2</id><hostname>keeper-2</hostname><port>9234</port></server>
+            <server><id>3</id><hostname>keeper-3</hostname><port>9234</port></server>
+        </raft_configuration>
+    </keeper_server>
+
+    <!-- Native Prometheus endpoint. Keeper needs no exporter: it speaks the
+         format directly. Picked up by the docker-sd job in 02-monitoring
+         through the labels on the container. -->
+    <prometheus>
+        <endpoint>/metrics</endpoint>
+        <port>9363</port>
+        <metrics>true</metrics>
+        <events>true</events>
+        <asynchronous_metrics>true</asynchronous_metrics>
+    </prometheus>
+
+</clickhouse>

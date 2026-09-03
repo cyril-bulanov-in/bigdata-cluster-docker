@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<!--
+  ============================================================================
+   Native Prometheus endpoint
+  ============================================================================
+   ClickHouse needs no exporter. It speaks the Prometheus text format itself,
+   which is why 03-dbms adds a postgres-exporter container but nothing
+   equivalent for ClickHouse.
+
+   Prometheus finds these nodes through the docker-sd job in 02-monitoring,
+   using the labels on the containers, with no change to prometheus.yml.
+  ============================================================================
+-->
+<clickhouse>
+    <prometheus>
+        <endpoint>/metrics</endpoint>
+        <port>9363</port>
+
+        <!-- Current values: memory in use, active merges, open connections. -->
+        <metrics>true</metrics>
+        <!-- Counters since start: rows inserted, queries run, bytes read. -->
+        <events>true</events>
+        <!-- Sampled periodically rather than on demand: disk space, uptime,
+             replication queue length. Replication health lives here. -->
+        <asynchronous_metrics>true</asynchronous_metrics>
+        <!-- Error counters by type. Cheap, and the first thing you want when
+             something starts failing intermittently. -->
+        <errors>true</errors>
+    </prometheus>
+</clickhouse>

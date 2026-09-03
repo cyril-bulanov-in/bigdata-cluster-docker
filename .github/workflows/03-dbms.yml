@@ -1,0 +1,123 @@
+# Boots the source database, change capture and the broker on a clean runner
+# and checks that changes actually flow. The warehouse is deliberately absent —
+# see the "What continuous integration does not cover" section of
+# 03-dbms/README.md.
+#
+# Triggered by changes to 01-kafka and 02-monitoring as well, because this
+# stack includes both: a change to either can break it without touching a
+# single file in 03-dbms.
+
+name: 03-dbms
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '03-dbms/**'
+      - '02-monitoring/**'
+      - '01-kafka/**'
+      - '.github/workflows/03-dbms.yml'
+  pull_request:
+    paths:
+      - '03-dbms/**'
+      - '02-monitoring/**'
+      - '01-kafka/**'
+      - '.github/workflows/03-dbms.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: 03-dbms-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        working-directory: 03-dbms
+
+    # PROFILES= disables the clickhouse profile for every make target in this
+    # job, including down and clean. Setting it once here beats remembering it
+    # on each command.
+    env:
+      PROFILES: ""
+      SKIP_CLICKHOUSE: "1"
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Show Docker versions
+        run: |
+          docker --version
+          docker compose version
+
+      - name: Show available memory
+        # Nineteen containers on a 16 GiB runner. Printing this makes an
+        # out-of-memory kill diagnosable instead of mysterious.
+        run: free -h
+
+      # Three .env files, one per stack in the include chain. Each is read
+      # from its own directory by the compose file that lives there.
+      - name: Prepare .env files for CI
+        run: |
+          cp .env.example .env
+          cp ../02-monitoring/.env.example ../02-monitoring/.env
+          cp ../01-kafka/.env.example ../01-kafka/.env
+          # The runner has less memory than a workstation. Only the Kafka and
+          # Connect limits are lowered; every image version stays exactly as
+          # pinned, so CI tests the same versions that run locally.
+          #
+          # The container limit is set well above the heap on purpose: a JVM
+          # allocates plenty outside it, and a broker sitting at 90% of its
+          # limit would trip ContainerNearMemoryLimit and turn a healthy run
+          # red on a rule that is doing its job.
+          sed -i 's/^KAFKA_HEAP_OPTS=.*/KAFKA_HEAP_OPTS=-Xms256m -Xmx512m/' ../01-kafka/.env
+          sed -i 's/^KAFKA_MEM_LIMIT=.*/KAFKA_MEM_LIMIT=1500m/' ../01-kafka/.env
+          sed -i 's/^CONNECT_HEAP_OPTS=.*/CONNECT_HEAP_OPTS=-Xms256m -Xmx768m/' .env
+
+      - name: Validate the compose file and every include
+        run: make config
+
+      - name: Start everything except the warehouse
+        run: make up-light
+
+      - name: Register the Debezium connector
+        # The script waits for the Connect REST API and for the Postgres
+        # plugin to be loaded, so no sleep is needed before this.
+        run: make connector
+
+      - name: Let capture settle
+        # Debezium takes an initial snapshot of four tables before it starts
+        # streaming, and the smoke test asserts that topics exist and hold
+        # messages. Thirty seconds is comfortably more than the snapshot needs
+        # at this data volume.
+        run: sleep 30
+
+      - name: Smoke test, without the warehouse
+        run: make smoke
+
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== container status ==="
+          docker compose ps -a
+          echo ""
+          echo "=== connector status ==="
+          curl -fsS "http://localhost:8083/connectors/postgres-source/status" || true
+          echo ""
+          echo "=== replication slot ==="
+          docker compose exec -T postgres psql -U app -d shop -c \
+            "SELECT slot_name, active, plugin FROM pg_replication_slots" || true
+          echo ""
+          echo "=== cdc topics ==="
+          docker compose exec -T kafka-1 /opt/kafka/bin/kafka-topics.sh \
+            --bootstrap-server kafka-1:9092 --list | grep '^cdc\.' || true
+          echo ""
+          echo "=== logs ==="
+          docker compose logs --no-color --tail=150
+
+      - name: Tear down
+        if: always()
+        run: make clean

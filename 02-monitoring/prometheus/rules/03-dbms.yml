@@ -1,0 +1,286 @@
+# ============================================================================
+#  Alerting rules for the 03-dbms stack
+# ============================================================================
+#  This file lives here rather than in 03-dbms because Prometheus is a shared
+#  service: it mounts one rules directory, and each stack contributes a file
+#  to it. The naming convention is the stack's directory name.
+#
+#  Rules for a stack that is not running are harmless. Every expression below
+#  references a metric that only exists while the 03-dbms containers are up;
+#  with no metric there is no series, the expression matches nothing, and the
+#  rule stays inactive.
+#
+#  ---------------------------------------------------------------------------
+#  Verifying the metric names
+#  ---------------------------------------------------------------------------
+#  A rule that names a metric which does not exist never fires and never
+#  complains. It sits in the UI looking like coverage. Before trusting any of
+#  the ClickHouse rules below, confirm the series actually exist:
+#
+#      curl -s 'http://localhost:9090/api/v1/label/__name__/values' \
+#        | tr ',' '\n' | grep -iE 'ClickHouse(Metrics|AsyncMetrics|ProfileEvents)_'
+#
+#  ClickHouse exposes three families through its native endpoint:
+#    ClickHouseMetrics_*        current values, sampled on scrape
+#    ClickHouseAsyncMetrics_*   computed periodically in the background
+#    ClickHouseProfileEvents_*  counters since start
+#
+#  Which family a name belongs to is not guessable, and it changes between
+#  versions. Check rather than assume.
+# ============================================================================
+
+groups:
+
+  # --------------------------------------------------------------------------
+  #  Postgres
+  # --------------------------------------------------------------------------
+  - name: postgres
+    rules:
+
+      # pg_up is the exporter's own verdict: 1 when it could query the
+      # database, 0 when the connection failed. More specific than TargetDown —
+      # the exporter can be healthy while Postgres behind it is not.
+      - alert: PostgresDown
+        expr: pg_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "postgres-exporter cannot reach the database"
+
+      # Connections are a hard limit: once max_connections is reached, new
+      # clients are refused rather than queued. 80% is where a pool
+      # misconfiguration is still fixable.
+      - alert: PostgresConnectionsHigh
+        expr: |
+          sum(pg_stat_activity_count) by (instance)
+            / on(instance) pg_settings_max_connections * 100 > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Postgres is using {{ $value | printf \"%.0f\" }}% of max_connections"
+
+      # A replication slot nobody reads makes Postgres retain write-ahead log
+      # indefinitely, and the disk fills with no obvious culprit. This is the
+      # specific failure that made us leave slot creation to Debezium rather
+      # than putting it in the schema.
+      - alert: PostgresInactiveReplicationSlot
+        expr: pg_replication_slots_active == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Replication slot {{ $labels.slot_name }} has no consumer"
+          description: "Postgres retains WAL for an inactive slot until the disk is full."
+
+      - alert: PostgresLongRunningTransaction
+        expr: pg_stat_activity_max_tx_duration{state="active"} > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A transaction has been open for over 5 minutes"
+
+      # Deadlocks are always an application bug, never a database problem.
+      - alert: PostgresDeadlocks
+        expr: rate(pg_stat_database_deadlocks{datname!~"template.*|postgres"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Deadlocks detected in database {{ $labels.datname }}"
+
+  # --------------------------------------------------------------------------
+  #  Change data capture
+  # --------------------------------------------------------------------------
+  #  The failure these guard against is a quiet one. When capture stops,
+  #  nothing errors: the topics simply stop receiving messages, which looks
+  #  exactly like an idle database. The warehouse keeps serving stale data and
+  #  reports no problem at all.
+  # --------------------------------------------------------------------------
+  - name: debezium
+    rules:
+
+      # Connect does not restart failed tasks by itself. A failed task stays
+      # failed until someone posts to the restart endpoint.
+      - alert: ConnectTaskFailed
+        expr: connect_connector_failed_tasks > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Connector {{ $labels.connector }} has {{ $value }} failed task(s)"
+          description: "Change capture has stopped. Restart with: make connector-restart"
+
+      - alert: ConnectConnectorNotRunning
+        expr: connect_connector_running_tasks == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Connector {{ $labels.connector }} has no running task"
+
+      # Debezium lost its hold on the replication slot. The task may still
+      # report RUNNING while this is 0, because Connect considers a retrying
+      # connector to be running.
+      - alert: DebeziumDisconnected
+        expr: debezium_connected == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Debezium is not connected to {{ $labels.server }}"
+
+      # The CDC equivalent of consumer lag: how far behind the database clock
+      # the last processed event is.
+      - alert: DebeziumLagHigh
+        expr: debezium_milliseconds_behind_source > 60000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Capture is {{ $value | printf \"%.0f\" }} ms behind the database"
+
+      - alert: DebeziumQueueNearlyFull
+        expr: debezium_queue_remaining_capacity < 512
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Debezium's internal queue has {{ $value }} slots left"
+          description: "The connector is producing faster than Kafka accepts."
+
+  # --------------------------------------------------------------------------
+  #  ClickHouse
+  # --------------------------------------------------------------------------
+  - name: clickhouse
+    rules:
+
+      # The design is eight nodes. Written as a literal rather than derived
+      # from a metric: eight is a property of the architecture, and deriving
+      # it from what is currently running would make the rule agree with
+      # reality by definition.
+      - alert: ClickHouseNodeMissing
+        expr: count(up{job="clickhouse"} == 1) < 8
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Only {{ $value }} of 8 ClickHouse nodes are reporting"
+
+      # A replica that cannot reach Keeper turns read-only. It keeps serving
+      # SELECTs perfectly well, which is exactly why this needs an alert:
+      # writes fail while reads look fine.
+      - alert: ClickHouseReplicaReadOnly
+        expr: ClickHouseMetrics_ReadonlyReplica > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.instance }} has {{ $value }} read-only replica(s)"
+          description: "The node has lost Keeper. Writes to those tables are refused."
+
+      # Replication falling behind. A minute is generous on this platform,
+      # where a replica normally catches up within seconds.
+      - alert: ClickHouseReplicationLag
+        expr: ClickHouseAsyncMetrics_ReplicasMaxAbsoluteDelay > 60
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} is {{ $value }}s behind its replica"
+
+      # A queue that grows rather than drains means the replica cannot fetch
+      # parts — usually a network problem or a peer that is gone.
+      - alert: ClickHouseReplicationQueueGrowing
+        expr: ClickHouseAsyncMetrics_ReplicasMaxQueueSize > 100
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Replication queue on {{ $labels.instance }} is {{ $value }} entries deep"
+
+      # "Too many parts": inserts arriving faster than merges can combine
+      # them. ClickHouse first slows writes down, then refuses them. On this
+      # platform it would mean the Kafka engine is flushing tiny batches.
+      - alert: ClickHouseRejectedInserts
+        expr: increase(ClickHouseProfileEvents_RejectedInserts[10m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.instance }} is rejecting inserts — too many parts"
+
+      # Distributed inserts are asynchronous: the initiator writes files and
+      # forwards them in the background. A growing backlog means a shard is
+      # unreachable and rows are piling up on disk rather than arriving.
+      - alert: ClickHouseDistributedInsertsStuck
+        expr: ClickHouseMetrics_DistributedFilesToInsert > 100
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} distributed insert files pending on {{ $labels.instance }}"
+
+  # --------------------------------------------------------------------------
+  #  Keeper
+  # --------------------------------------------------------------------------
+  - name: clickhouse-keeper
+    rules:
+
+      # Three Keepers, majority of two. At one surviving node the quorum is
+      # gone: no leader election, no replication log, and every replica turns
+      # read-only within seconds.
+      - alert: KeeperQuorumAtRisk
+        expr: count(up{job="clickhouse-keeper"} == 1) < 3
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Only {{ $value }} of 3 Keeper nodes are reporting"
+          description: "The quorum survives one loss. At one node it is gone."
+
+      - alert: KeeperQuorumLost
+        expr: count(up{job="clickhouse-keeper"} == 1) < 2
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Keeper quorum lost — {{ $value }} of 3 nodes reporting"
+          description: "Every ReplicatedMergeTree table is now read-only."
+
+  # --------------------------------------------------------------------------
+  #  Ingestion into ClickHouse
+  # --------------------------------------------------------------------------
+  #  The quietest failure in the whole platform. The Kafka engine can poll
+  #  happily and read nothing, or a materialized view can fail on every insert
+  #  while the queue keeps consuming. Both leave every container green, every
+  #  scrape target up, and the warehouse frozen in time.
+  # --------------------------------------------------------------------------
+  - name: clickhouse-ingestion
+    rules:
+
+      # Under the generator's steady load, messages are always being read.
+      # A flat zero for ten minutes means ingestion has stopped, whatever the
+      # containers say.
+      - alert: ClickHouseKafkaIngestionStalled
+        expr: sum(increase(ClickHouseProfileEvents_KafkaMessagesRead[10m])) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "ClickHouse has read no Kafka messages for ten minutes"
+          description: "Check: make ch-queues, then make ch-consumers."
+
+      # Parse or insert failures. Any nonzero rate means messages are being
+      # rejected, and with kafka_skip_broken_messages = 0 the stream stops
+      # rather than losing them silently.
+      - alert: ClickHouseKafkaErrors
+        expr: increase(ClickHouseProfileEvents_KafkaConsumerErrors[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka consumer errors on {{ $labels.instance }}"
+          description: "See the exceptions.text column: make ch-queues"

@@ -1,0 +1,60 @@
+<?xml version="1.0"?>
+<!--
+  ============================================================================
+   The default user, and why this file has to exist
+  ============================================================================
+   The image's entrypoint checks for CLICKHOUSE_USER and CLICKHOUSE_PASSWORD.
+   Finding neither, it writes /etc/clickhouse-server/users.d/default-user.xml
+   restricting the `default` user to 127.0.0.1 and ::1, and says so in one log
+   line at startup:
+
+       /entrypoint.sh: neither CLICKHOUSE_USER nor CLICKHOUSE_PASSWORD is set,
+       disabling network access for user 'default'
+
+   That is a sensible default for a single server exposed to the world. On a
+   cluster it breaks everything that crosses a node boundary:
+
+       DB::Exception: Received from clickhouse-02:9000.
+       default: Authentication failed: password is incorrect, or there is no
+       user with such name. (AUTHENTICATION_FAILED)
+
+   The confusing part is what still works. `CREATE ... ON CLUSTER` succeeds,
+   because it is not a connection between nodes at all: the statement goes
+   into a queue in Keeper and each node picks it up and runs it locally. So
+   the cluster looks configured, DDL propagates, and only a genuinely
+   distributed query — clusterAllReplicas, a Distributed table, a replica
+   fetching a part — fails. One broken thing hidden behind a working one.
+
+   This file restores network access. It is named 99- so that it merges after
+   the entrypoint's default-user.xml and wins.
+
+   No password, deliberately. Adding one here would mean also putting
+   credentials into remote_servers for distributed queries and into
+   interserver_http_credentials for replication — three places to keep in
+   step, for a cluster whose ports are not published outside this machine.
+   Revisit before anything here is reachable from elsewhere.
+  ============================================================================
+-->
+<clickhouse>
+    <users>
+        <default>
+            <!-- Empty rather than absent: an absent password element would
+                 leave whatever the merged configuration had before. -->
+            <password></password>
+
+            <!-- Any address. In practice that means the dataplatform docker
+                 network, since only node 1 publishes a native port and only
+                 to localhost. -->
+            <networks replace="replace">
+                <ip>::/0</ip>
+            </networks>
+
+            <profile>default</profile>
+            <quota>default</quota>
+
+            <!-- Needed for CREATE ... ON CLUSTER and for managing users later.
+                 Without it the default user can query but not grant. -->
+            <access_management>1</access_management>
+        </default>
+    </users>
+</clickhouse>

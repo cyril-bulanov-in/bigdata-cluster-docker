@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<!--
+   Macros for clickhouse-03 — shard 2, replica 1.
+   See clickhouse-01.xml for what these mean and why they matter.
+-->
+<clickhouse>
+    <macros>
+        <cluster>platform</cluster>
+        <shard>2</shard>
+        <replica>clickhouse-03</replica>
+    </macros>
+</clickhouse>

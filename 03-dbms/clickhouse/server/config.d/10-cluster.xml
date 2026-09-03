@@ -1,0 +1,117 @@
+<?xml version="1.0"?>
+<!--
+  ============================================================================
+   Cluster topology and Keeper connection
+  ============================================================================
+   Files in config.d are merged into the server configuration in alphabetical
+   order. Keeping each concern in its own file means a change here never risks
+   the rest, and the numeric prefix makes the merge order explicit.
+
+   Note what is NOT here: listen_host.
+
+   The image already ships docker_related_config.xml, which sets it to both ::
+   and 0.0.0.0 with listen_try enabled. Adding it again makes the server try
+   to bind an address it has already bound, and every port logs
+
+       Listen [0.0.0.0]:9009 failed: Address already in use
+
+   Harmless, because listen_try turns it into a warning, but it fills the log
+   with something that looks like a real conflict.
+  ============================================================================
+-->
+<clickhouse>
+
+    <!-- ========================================================================
+         Where the replicas coordinate
+         ========================================================================
+         The section is still called <zookeeper> for compatibility; it points
+         at ClickHouse Keeper. Every ReplicatedMergeTree table registers itself
+         here, and this is how two nodes discover they are replicas of the same
+         table rather than two unrelated tables with the same name.
+
+         Still three Keepers for eight ClickHouse nodes, and that is correct.
+         The quorum size has nothing to do with the number of servers it
+         coordinates: it is about surviving the loss of a Keeper. Three
+         survives one. Adding more would slow every write to the quorum down,
+         because more nodes have to agree.
+    ======================================================================== -->
+    <zookeeper>
+        <node><host>keeper-1</host><port>9181</port></node>
+        <node><host>keeper-2</host><port>9181</port></node>
+        <node><host>keeper-3</host><port>9181</port></node>
+    </zookeeper>
+
+    <!-- ========================================================================
+         The cluster: four shards, two replicas each
+         ========================================================================
+         Shards divide the data; replicas copy it. They are independent
+         mechanisms configured in different places: sharding lives here,
+         replication lives in the macros file and in the table's path in
+         Keeper.
+
+         Grown from two shards to four. Nothing about the mechanism changed —
+         two more blocks, four more nodes, four more macros files. That was
+         the point of building it at two first: the second half is arithmetic.
+
+         What does NOT happen automatically: existing data does not move.
+         ClickHouse never rebalances a table when shards are added. Rows
+         already written stay on the shard that received them, and only new
+         rows are spread over four. `make ch-rows` right after this change
+         shows exactly that — the new nodes at zero while the old ones hold
+         everything. In production this is handled either by planning enough
+         shards up front, or by copying data out and back in.
+
+         replace="true" discards the sample clusters that ship with the image
+         (test_shard_localhost and friends), so `system.clusters` shows only
+         what this file declares.
+
+         internal_replication=true is the setting that matters most in this
+         file. It tells a Distributed table to write each row to ONE replica
+         of the target shard and let ReplicatedMergeTree copy it to the other.
+         With false, the Distributed table would write to both replicas
+         itself, and replication would then copy them again, producing
+         duplicates. The correct value with any Replicated engine is true.
+    ======================================================================== -->
+    <remote_servers replace="true">
+        <platform>
+
+            <shard>
+                <internal_replication>true</internal_replication>
+                <replica><host>clickhouse-01</host><port>9000</port></replica>
+                <replica><host>clickhouse-02</host><port>9000</port></replica>
+            </shard>
+
+            <shard>
+                <internal_replication>true</internal_replication>
+                <replica><host>clickhouse-03</host><port>9000</port></replica>
+                <replica><host>clickhouse-04</host><port>9000</port></replica>
+            </shard>
+
+            <shard>
+                <internal_replication>true</internal_replication>
+                <replica><host>clickhouse-05</host><port>9000</port></replica>
+                <replica><host>clickhouse-06</host><port>9000</port></replica>
+            </shard>
+
+            <shard>
+                <internal_replication>true</internal_replication>
+                <replica><host>clickhouse-07</host><port>9000</port></replica>
+                <replica><host>clickhouse-08</host><port>9000</port></replica>
+            </shard>
+
+        </platform>
+    </remote_servers>
+
+    <!-- ========================================================================
+         Distributed DDL
+         ========================================================================
+         What makes `CREATE TABLE ... ON CLUSTER platform` work: the statement
+         is written to a queue in Keeper and every node picks it up. The four
+         new nodes will therefore create the staging tables themselves the
+         first time `make ch-schema` runs after they join.
+    ======================================================================== -->
+    <distributed_ddl>
+        <path>/clickhouse/task_queue/ddl</path>
+    </distributed_ddl>
+
+</clickhouse>

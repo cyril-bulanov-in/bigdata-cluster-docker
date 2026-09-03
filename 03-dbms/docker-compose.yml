@@ -1,0 +1,536 @@
+# ============================================================================
+#  PLATFORM — step 3: databases
+# ============================================================================
+#
+#  Postgres as the operational source, Debezium capturing every change into
+#  Kafka, and a ClickHouse cluster of four shards with two replicas each
+#  consuming those changes into a staging layer.
+#
+#  Start:   make up          everything
+#           make up-light    everything except the warehouse
+#  Check:   make test
+#
+# ----------------------------------------------------------------------------
+#  What this file includes
+# ----------------------------------------------------------------------------
+#  It includes 02-monitoring, which in turn includes 01-kafka. So `make up`
+#  here starts the whole platform. All three files declare `name: platform`,
+#  so it stays one Compose project.
+#
+#  Consequence: `make clean` here removes every volume in the project.
+#
+# ----------------------------------------------------------------------------
+#  The `clickhouse` profile
+# ----------------------------------------------------------------------------
+#  The eight ClickHouse nodes and three Keepers carry `profiles: [clickhouse]`,
+#  so they start only when that profile is enabled. Everything else starts
+#  unconditionally.
+#
+#  Two reasons.
+#
+#  Resources. Eight nodes at 2 GiB is 16 GiB before anything else runs. A
+#  GitHub Actions runner has 16 GiB in total, so continuous integration cannot
+#  start the warehouse at all — it starts the rest and says so. See the README.
+#
+#  Usefulness. On a smaller machine the source, the capture and the broker are
+#  still worth having on their own, and `make up-light` gives exactly that.
+#
+#  The Makefile enables the profile by default, so `make up` behaves as if
+#  none of this were here.
+# ----------------------------------------------------------------------------
+include:
+  - ../02-monitoring/docker-compose.yml
+
+name: platform
+
+# ----------------------------------------------------------------------------
+#  Shared settings for the three Keeper nodes
+# ----------------------------------------------------------------------------
+#  Keeper is what ReplicatedMergeTree coordinates through: the replication log,
+#  leader election for merges, ON CLUSTER statements, and the insert hashes
+#  used for deduplication. The data lives on the ClickHouse nodes; everything
+#  the replicas must agree about lives here.
+#
+#  Three, because Raft decides by majority — the same arithmetic as the KRaft
+#  controllers in 01-kafka. Separate containers rather than embedded in the
+#  servers: a slow Keeper stalls merges and inserts across the entire cluster,
+#  and a co-located heavy merge is exactly what makes it slow.
+# ----------------------------------------------------------------------------
+x-keeper: &keeper
+  image: clickhouse/clickhouse-keeper:${CLICKHOUSE_VERSION}
+  profiles: ["clickhouse"]
+  restart: unless-stopped
+  networks: [dataplatform]
+  labels:
+    # Keeper serves Prometheus metrics natively; no exporter needed.
+    prometheus.scrape: "true"
+    prometheus.port: "9363"
+    prometheus.job: "clickhouse-keeper"
+  healthcheck:
+    # The readiness endpoint enabled in the Keeper config, not a port check.
+    # It answers the stronger question: has this node joined the quorum and is
+    # it serving. A Keeper that is up but isolated from the other two is
+    # exactly the state a port check would call healthy.
+    #
+    # busybox wget, because the image is Alpine-based: no bash, so no
+    # /dev/tcp, and no curl.
+    test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9182/ready | grep -q '\"status\":\"ok\"' || exit 1"]
+    interval: 15s
+    timeout: 10s
+    retries: 10
+    start_period: 30s
+
+# ----------------------------------------------------------------------------
+#  Shared settings for the eight ClickHouse nodes
+# ----------------------------------------------------------------------------
+#  Everything identical between nodes lives here. Exactly two things differ per
+#  node: the macros file mounted in, which declares its shard and replica, and
+#  which host port it publishes.
+# ----------------------------------------------------------------------------
+x-clickhouse: &clickhouse
+  image: clickhouse/clickhouse-server:${CLICKHOUSE_VERSION}
+  profiles: ["clickhouse"]
+  restart: unless-stopped
+  networks: [dataplatform]
+  environment:
+    # Honoured only while initialising an empty data directory, so it cannot
+    # be relied on — a node that started once and failed has a non-empty
+    # volume and will skip it forever after. `make ch-init` creates the
+    # database explicitly with ON CLUSTER, which also puts it on every node.
+    CLICKHOUSE_DB: ${CH_DB}
+  ulimits:
+    # ClickHouse opens a file per column per data part and refuses to start
+    # under the default limit.
+    nofile:
+      soft: 262144
+      hard: 262144
+  deploy:
+    resources:
+      limits:
+        # Eight nodes. At 2 GiB each that is 16 GiB of the Docker budget
+        # before Kafka, Prometheus and the rest.
+        memory: ${CLICKHOUSE_MEM_LIMIT}
+  labels:
+    # Native Prometheus endpoint, enabled in config.d/20-prometheus.xml.
+    prometheus.scrape: "true"
+    prometheus.port: "9363"
+    prometheus.job: "clickhouse"
+  healthcheck:
+    test: ["CMD-SHELL", "wget -qO- http://localhost:8123/ping | grep -q Ok || exit 1"]
+    interval: 15s
+    timeout: 10s
+    retries: 10
+    start_period: 30s
+  depends_on:
+    # Waiting for quorum, not merely for the processes.
+    keeper-1: { condition: service_healthy }
+    keeper-2: { condition: service_healthy }
+    keeper-3: { condition: service_healthy }
+
+services:
+
+  # ==========================================================================
+  #  Keeper 1 of 3
+  # ==========================================================================
+  keeper-1:
+    <<: *keeper
+    container_name: keeper-1
+    hostname: keeper-1
+    volumes:
+      # Only the config differs between the three; server_id is inside it.
+      - ./clickhouse/keeper/keeper-1.xml:/etc/clickhouse-keeper/keeper_config.xml:ro
+      # Mounted at /var/lib/clickhouse because the image creates and owns that
+      # path as uid 101. A volume on a path the image does not know about
+      # arrives owned by root, and Keeper cannot write to it.
+      - keeper-1-data:/var/lib/clickhouse
+
+  # ==========================================================================
+  #  Keeper 2 of 3
+  # ==========================================================================
+  keeper-2:
+    <<: *keeper
+    container_name: keeper-2
+    hostname: keeper-2
+    volumes:
+      - ./clickhouse/keeper/keeper-2.xml:/etc/clickhouse-keeper/keeper_config.xml:ro
+      - keeper-2-data:/var/lib/clickhouse
+
+  # ==========================================================================
+  #  Keeper 3 of 3
+  # ==========================================================================
+  keeper-3:
+    <<: *keeper
+    container_name: keeper-3
+    hostname: keeper-3
+    volumes:
+      - ./clickhouse/keeper/keeper-3.xml:/etc/clickhouse-keeper/keeper_config.xml:ro
+      - keeper-3-data:/var/lib/clickhouse
+
+  # ==========================================================================
+  #  clickhouse-01 — shard 1, replica 1
+  # ==========================================================================
+  clickhouse-01:
+    <<: *clickhouse
+    container_name: clickhouse-01
+    hostname: clickhouse-01
+    volumes:
+      # ----------------------------------------------------------------
+      #  Separate file mounts, not one directory mount
+      # ----------------------------------------------------------------
+      #  Mounting ./clickhouse/server/config.d as a directory and then the
+      #  macros file into it does not work:
+      #
+      #    create mountpoint ...: read-only file system
+      #
+      #  Docker mounts the directory first, read-only, then has to create a
+      #  file inside it as the mountpoint for the second mount, and cannot.
+      #  A mount can never be nested inside a read-only mount.
+      #
+      #  Mounting each file individually avoids the nesting. They land in the
+      #  image's own config.d, an ordinary writable directory.
+      # ----------------------------------------------------------------
+      - ./clickhouse/server/config.d/10-cluster.xml:/etc/clickhouse-server/config.d/10-cluster.xml:ro
+      - ./clickhouse/server/config.d/20-prometheus.xml:/etc/clickhouse-server/config.d/20-prometheus.xml:ro
+      - ./clickhouse/server/config.d/30-limits.xml:/etc/clickhouse-server/config.d/30-limits.xml:ro
+      # Restores network access for the `default` user, which the image's
+      # entrypoint disables when no CLICKHOUSE_USER is given. Without it
+      # ON CLUSTER still works — it flows through Keeper — while every
+      # genuinely distributed query fails with AUTHENTICATION_FAILED.
+      - ./clickhouse/server/users.d/99-default.xml:/etc/clickhouse-server/users.d/99-default.xml:ro
+      # The one file that differs per node. It declares shard 1 and
+      # replica 1; two nodes with the same shard number get the same
+      # path in Keeper, and that is what makes them replicas.
+      - ./clickhouse/server/macros/clickhouse-01.xml:/etc/clickhouse-server/config.d/99-macros.xml:ro
+      - clickhouse-01-data:/var/lib/clickhouse
+    ports:
+      # Only this node publishes the native port; every make target uses it.
+      # The others are reachable over HTTP, which is enough to ask each
+      # replica separately what it sees.
+      - "${CH_HTTP_PORT_01}:8123"
+      - "${CH_NATIVE_PORT_01}:9000"
+
+  # ==========================================================================
+  #  clickhouse-02 — shard 1, replica 2
+  # ==========================================================================
+  clickhouse-02:
+    <<: *clickhouse
+    container_name: clickhouse-02
+    hostname: clickhouse-02
+    volumes:
+      - ./clickhouse/server/config.d/10-cluster.xml:/etc/clickhouse-server/config.d/10-cluster.xml:ro
+      - ./clickhouse/server/config.d/20-prometheus.xml:/etc/clickhouse-server/config.d/20-prometheus.xml:ro
+      - ./clickhouse/server/config.d/30-limits.xml:/etc/clickhouse-server/config.d/30-limits.xml:ro
+      - ./clickhouse/server/users.d/99-default.xml:/etc/clickhouse-server/users.d/99-default.xml:ro
+      - ./clickhouse/server/macros/clickhouse-02.xml:/etc/clickhouse-server/config.d/99-macros.xml:ro
+      - clickhouse-02-data:/var/lib/clickhouse
+    ports:
+      - "${CH_HTTP_PORT_02}:8123"
+
+  # ==========================================================================
+  #  clickhouse-03 — shard 2, replica 1
+  # ==========================================================================
+  clickhouse-03:
+    <<: *clickhouse
+    container_name: clickhouse-03
+    hostname: clickhouse-03
+    volumes:
+      - ./clickhouse/server/config.d/10-cluster.xml:/etc/clickhouse-server/config.d/10-cluster.xml:ro
+      - ./clickhouse/server/config.d/20-prometheus.xml:/etc/clickhouse-server/config.d/20-prometheus.xml:ro
+      - ./clickhouse/server/config.d/30-limits.xml:/etc/clickhouse-server/config.d/30-limits.xml:ro
+      - ./clickhouse/server/users.d/99-default.xml:/etc/clickhouse-server/users.d/99-default.xml:ro
+      - ./clickhouse/server/macros/clickhouse-03.xml:/etc/clickhouse-server/config.d/99-macros.xml:ro
+      - clickhouse-03-data:/var/lib/clickhouse
+    ports:
+      - "${CH_HTTP_PORT_03}:8123"
+
+  # ==========================================================================
+  #  clickhouse-04 — shard 2, replica 2
+  # ==========================================================================
+  clickhouse-04:
+    <<: *clickhouse
+    container_name: clickhouse-04
+    hostname: clickhouse-04
+    volumes:
+      - ./clickhouse/server/config.d/10-cluster.xml:/etc/clickhouse-server/config.d/10-cluster.xml:ro
+      - ./clickhouse/server/config.d/20-prometheus.xml:/etc/clickhouse-server/config.d/20-prometheus.xml:ro
+      - ./clickhouse/server/config.d/30-limits.xml:/etc/clickhouse-server/config.d/30-limits.xml:ro
+      - ./clickhouse/server/users.d/99-default.xml:/etc/clickhouse-server/users.d/99-default.xml:ro
+      - ./clickhouse/server/macros/clickhouse-04.xml:/etc/clickhouse-server/config.d/99-macros.xml:ro
+      - clickhouse-04-data:/var/lib/clickhouse
+    ports:
+      - "${CH_HTTP_PORT_04}:8123"
+
+  # ==========================================================================
+  #  clickhouse-05 — shard 3, replica 1
+  # ==========================================================================
+  clickhouse-05:
+    <<: *clickhouse
+    container_name: clickhouse-05
+    hostname: clickhouse-05
+    volumes:
+      - ./clickhouse/server/config.d/10-cluster.xml:/etc/clickhouse-server/config.d/10-cluster.xml:ro
+      - ./clickhouse/server/config.d/20-prometheus.xml:/etc/clickhouse-server/config.d/20-prometheus.xml:ro
+      - ./clickhouse/server/config.d/30-limits.xml:/etc/clickhouse-server/config.d/30-limits.xml:ro
+      - ./clickhouse/server/users.d/99-default.xml:/etc/clickhouse-server/users.d/99-default.xml:ro
+      - ./clickhouse/server/macros/clickhouse-05.xml:/etc/clickhouse-server/config.d/99-macros.xml:ro
+      - clickhouse-05-data:/var/lib/clickhouse
+    ports:
+      - "${CH_HTTP_PORT_05}:8123"
+
+  # ==========================================================================
+  #  clickhouse-06 — shard 3, replica 2
+  # ==========================================================================
+  clickhouse-06:
+    <<: *clickhouse
+    container_name: clickhouse-06
+    hostname: clickhouse-06
+    volumes:
+      - ./clickhouse/server/config.d/10-cluster.xml:/etc/clickhouse-server/config.d/10-cluster.xml:ro
+      - ./clickhouse/server/config.d/20-prometheus.xml:/etc/clickhouse-server/config.d/20-prometheus.xml:ro
+      - ./clickhouse/server/config.d/30-limits.xml:/etc/clickhouse-server/config.d/30-limits.xml:ro
+      - ./clickhouse/server/users.d/99-default.xml:/etc/clickhouse-server/users.d/99-default.xml:ro
+      - ./clickhouse/server/macros/clickhouse-06.xml:/etc/clickhouse-server/config.d/99-macros.xml:ro
+      - clickhouse-06-data:/var/lib/clickhouse
+    ports:
+      - "${CH_HTTP_PORT_06}:8123"
+
+  # ==========================================================================
+  #  clickhouse-07 — shard 4, replica 1
+  # ==========================================================================
+  clickhouse-07:
+    <<: *clickhouse
+    container_name: clickhouse-07
+    hostname: clickhouse-07
+    volumes:
+      - ./clickhouse/server/config.d/10-cluster.xml:/etc/clickhouse-server/config.d/10-cluster.xml:ro
+      - ./clickhouse/server/config.d/20-prometheus.xml:/etc/clickhouse-server/config.d/20-prometheus.xml:ro
+      - ./clickhouse/server/config.d/30-limits.xml:/etc/clickhouse-server/config.d/30-limits.xml:ro
+      - ./clickhouse/server/users.d/99-default.xml:/etc/clickhouse-server/users.d/99-default.xml:ro
+      - ./clickhouse/server/macros/clickhouse-07.xml:/etc/clickhouse-server/config.d/99-macros.xml:ro
+      - clickhouse-07-data:/var/lib/clickhouse
+    ports:
+      - "${CH_HTTP_PORT_07}:8123"
+
+  # ==========================================================================
+  #  clickhouse-08 — shard 4, replica 2
+  # ==========================================================================
+  clickhouse-08:
+    <<: *clickhouse
+    container_name: clickhouse-08
+    hostname: clickhouse-08
+    volumes:
+      - ./clickhouse/server/config.d/10-cluster.xml:/etc/clickhouse-server/config.d/10-cluster.xml:ro
+      - ./clickhouse/server/config.d/20-prometheus.xml:/etc/clickhouse-server/config.d/20-prometheus.xml:ro
+      - ./clickhouse/server/config.d/30-limits.xml:/etc/clickhouse-server/config.d/30-limits.xml:ro
+      - ./clickhouse/server/users.d/99-default.xml:/etc/clickhouse-server/users.d/99-default.xml:ro
+      - ./clickhouse/server/macros/clickhouse-08.xml:/etc/clickhouse-server/config.d/99-macros.xml:ro
+      - clickhouse-08-data:/var/lib/clickhouse
+    ports:
+      - "${CH_HTTP_PORT_08}:8123"
+
+  # ==========================================================================
+  #  Postgres — the operational source
+  # ==========================================================================
+  #  No profile: this is the half of the stack that runs everywhere, including
+  #  in continuous integration.
+  # ==========================================================================
+  postgres:
+    image: postgres:${POSTGRES_VERSION}
+    container_name: postgres
+    restart: unless-stopped
+    networks: [dataplatform]
+    command:
+      - postgres
+      # wal_level=logical is what makes change data capture possible: it puts
+      # row-level content into the write-ahead log. Changing it needs a
+      # restart, which is why it was set from the very first part rather than
+      # when Debezium arrived.
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=8
+      - -c
+      - max_wal_senders=8
+      - -c
+      - log_min_duration_statement=200
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      # A directory mount, and safe here because nothing is mounted inside it.
+      # Scripts run once, only when the data volume is created empty.
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    healthcheck:
+      # -U matters: without it pg_isready uses the OS user, which is `root`
+      # inside the container and does not exist in the database.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # ==========================================================================
+  #  postgres-exporter — the database's metrics
+  # ==========================================================================
+  #  Registered by label, not by editing prometheus.yml. Prometheus discovers
+  #  containers through the Docker API and scrapes the ones that opted in.
+  # ==========================================================================
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:${POSTGRES_EXPORTER_VERSION}
+    container_name: postgres-exporter
+    restart: unless-stopped
+    networks: [dataplatform]
+    environment:
+      DATA_SOURCE_NAME: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable"
+      PG_EXPORTER_AUTO_DISCOVER_DATABASES: "true"
+    labels:
+      prometheus.scrape: "true"
+      prometheus.port: "9187"
+      prometheus.job: "postgres"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9187/metrics >/dev/null 2>&1 || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 6
+      start_period: 20s
+
+  # ==========================================================================
+  #  Kafka Connect with Debezium — change data capture
+  # ==========================================================================
+  #  Connect is a runtime driven entirely through a REST API. The connector
+  #  itself is registered by `make connector`.
+  #
+  #  Postgres writes every change to its write-ahead log; Debezium opens a
+  #  logical replication slot, which is a bookmark into that log, and streams
+  #  from it. Not polling, not triggers — the database does no extra work
+  #  beyond what it already does for its own durability.
+  # ==========================================================================
+  kafka-connect:
+    image: quay.io/debezium/connect:${DEBEZIUM_VERSION}
+    container_name: kafka-connect
+    restart: unless-stopped
+    networks: [dataplatform]
+    environment:
+      BOOTSTRAP_SERVERS: kafka-1:9092,kafka-2:9092,kafka-3:9092,kafka-4:9092
+      GROUP_ID: platform-connect
+      # Connect keeps its own state in Kafka topics rather than on disk, which
+      # is what makes the worker disposable. The offset topic is the important
+      # one: it holds how far Debezium has read.
+      CONFIG_STORAGE_TOPIC: _connect_configs
+      OFFSET_STORAGE_TOPIC: _connect_offsets
+      STATUS_STORAGE_TOPIC: _connect_status
+      CONFIG_STORAGE_REPLICATION_FACTOR: "3"
+      OFFSET_STORAGE_REPLICATION_FACTOR: "3"
+      STATUS_STORAGE_REPLICATION_FACTOR: "3"
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      # Without these, every message carries a copy of its own schema and
+      # grows roughly fourfold.
+      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      # For CDC acks=all is not optional: a lost event is a row that silently
+      # disagrees between source and warehouse forever.
+      CONNECT_PRODUCER_ACKS: "all"
+      CONNECT_PRODUCER_COMPRESSION_TYPE: lz4
+      KAFKA_HEAP_OPTS: ${CONNECT_HEAP_OPTS}
+      # JMXHOST must match the container name: RMI hands the client a hostname
+      # to call back on, and an unresolvable one makes the connection hang.
+      JMXHOST: kafka-connect
+      JMXPORT: "9999"
+    ports:
+      - "${CONNECT_PORT}:8083"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka-1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8083/ >/dev/null || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 45s
+    stop_grace_period: 30s
+
+  # ==========================================================================
+  #  jmx-connect — metrics for Kafka Connect and the Debezium connector
+  # ==========================================================================
+  #  Same image as the four broker exporters, built in 02-monitoring.
+  #  JMX_CONFIG selects the rule set: a broker and a Connect worker share no
+  #  MBeans, so pointing the Kafka rules at Connect would produce a valid but
+  #  empty endpoint — a green target with no data.
+  # ==========================================================================
+  jmx-connect:
+    image: dataplatform/jmx-exporter:${JMX_EXPORTER_VERSION}
+    container_name: jmx-connect
+    restart: unless-stopped
+    networks: [dataplatform]
+    environment:
+      JMX_TARGET: kafka-connect:9999
+      JMX_CONFIG: connect
+    labels:
+      prometheus.scrape: "true"
+      prometheus.port: "5556"
+      prometheus.job: "kafka-connect"
+    depends_on:
+      kafka-connect:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5556/metrics >/dev/null 2>&1 || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 6
+      start_period: 40s
+
+  # ==========================================================================
+  #  Data generator — keeps the source changing
+  # ==========================================================================
+  #  A static database produces no change events, no consumer lag and flat
+  #  graphs. Every statement it issues becomes a message in Kafka, and the
+  #  smoke test checks that the row count is actually moving before trusting
+  #  anything downstream.
+  # ==========================================================================
+  generator:
+    build:
+      context: ./generator
+    image: dataplatform/generator:${GENERATOR_VERSION}
+    container_name: generator
+    restart: unless-stopped
+    networks: [dataplatform]
+    environment:
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: ${POSTGRES_DB}
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      SEED_CUSTOMERS: ${SEED_CUSTOMERS}
+      SEED_PRODUCTS: ${SEED_PRODUCTS}
+      ORDERS_PER_MINUTE: ${ORDERS_PER_MINUTE}
+      P_ADVANCE_ORDER: ${P_ADVANCE_ORDER}
+      P_UPDATE_PRICE: ${P_UPDATE_PRICE}
+      P_NEW_CUSTOMER: ${P_NEW_CUSTOMER}
+      P_DELETE_CUSTOMER: ${P_DELETE_CUSTOMER}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  keeper-1-data:
+  keeper-2-data:
+  keeper-3-data:
+  clickhouse-01-data:
+  clickhouse-02-data:
+  clickhouse-03-data:
+  clickhouse-04-data:
+  clickhouse-05-data:
+  clickhouse-06-data:
+  clickhouse-07-data:
+  clickhouse-08-data:

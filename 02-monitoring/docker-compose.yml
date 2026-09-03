@@ -1,5 +1,5 @@
 # ============================================================================
-#  PLATFORM — step 2: monitoring (complete)
+#  PLATFORM — step 2: monitoring
 # ============================================================================
 #
 #  Prometheus collects, Grafana draws, four kinds of exporter translate.
@@ -166,15 +166,6 @@ services:
   #  kill looks like a random restart.
   #
   #  Built from the GitHub release binary — see cadvisor/Dockerfile for why.
-  #
-  #  The privileges below each have a reason:
-  #    privileged        cgroup files of *other* containers are not readable
-  #                      by an ordinary container
-  #    /dev/kmsg         used to detect OOM kills as they happen
-  #    /:/rootfs         machine-level context: filesystems, uptime
-  #    /sys              where the cgroup accounting actually lives
-  #    docker.sock       the Docker API, for container metadata
-  #    containerd.sock   see the note below — this one is easy to miss
   # ==========================================================================
   cadvisor:
     build:
@@ -188,8 +179,6 @@ services:
     command:
       - '--docker_only=true'
       - '--housekeeping_interval=10s'
-      # Compose attaches half a dozen labels to every container; turning them
-      # into Prometheus labels is a lot of cardinality for nothing.
       - '--store_container_labels=false'
     privileged: true
     devices:
@@ -198,27 +187,11 @@ services:
       - /:/rootfs:ro
       - /sys:/sys:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      # ----------------------------------------------------------------------
-      #  Easy to miss, and the failure it causes looks like something else.
-      #
-      #  Docker has run containers through containerd for years, and modern
-      #  cAdvisor asks containerd for them, not the Docker daemon. Without this
-      #  socket its docker factory fails to register:
-      #
-      #    Registration of the docker container factory failed: unable to
-      #    create containerd client: dial unix /run/containerd/containerd.sock:
-      #    connect: no such file or directory
-      #
-      #  Only the Raw and systemd factories survive, and --docker_only then
-      #  discards everything they found, since nothing was recognised as a
-      #  Docker container. The visible symptom is not an error: /metrics
-      #  answers, the scrape target is green, several hundred container_*
-      #  metrics are exported — and every one of them is the root cgroup,
-      #  id="/". Any query filtering on name!="" comes back empty.
-      # ----------------------------------------------------------------------
+      # Modern cAdvisor asks containerd for containers, not the Docker daemon.
+      # Without this socket its docker factory fails to register and every
+      # exported metric is the root cgroup, with no container name.
       - /run/containerd/containerd.sock:/run/containerd/containerd.sock:ro
     ports:
-      # 8080 on the host is taken by Kafbat UI, hence a different port.
       - "${CADVISOR_PORT}:8080"
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8080/healthz >/dev/null || exit 1"]
@@ -235,6 +208,22 @@ services:
     container_name: prometheus
     restart: unless-stopped
     networks: [dataplatform]
+
+    # ------------------------------------------------------------------------
+    #  Read access to the Docker socket, without running as root
+    # ------------------------------------------------------------------------
+    #  The docker-sd job in prometheus.yml asks Docker what is running. The
+    #  socket is owned by root:root with mode 660, and the Prometheus image
+    #  runs as `nobody` — so by default the connection is refused.
+    #
+    #  group_add adds a supplementary group to the existing user rather than
+    #  changing it. Group 0 is root's group, which is the socket's group, so
+    #  this grants exactly the access needed and nothing else. Running the
+    #  whole process as root would have worked too, and would have been worse.
+    # ------------------------------------------------------------------------
+    group_add:
+      - "0"
+
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
@@ -247,8 +236,11 @@ services:
       # creates a *directory* with that name and Prometheus dies with
       # "is a directory".
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      # A DIRECTORY, matching the glob in prometheus.yml.
+      # A DIRECTORY, matching the glob in prometheus.yml. Later stacks drop
+      # their own rules file in here, named after the stack.
       - ./prometheus/rules:/etc/prometheus/rules:ro
+      # For the docker-sd job. Read-only: Prometheus only ever lists.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
       - prometheus-data:/prometheus
     ports:
       - "${PROMETHEUS_PORT}:9090"
@@ -285,13 +277,8 @@ services:
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
     volumes:
-      # Two provisioning directories, mounted separately rather than mounting
-      # the whole provisioning tree: the Grafana image ships other
-      # subdirectories there, and replacing all of them is a bigger change
-      # than this stack needs.
       - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
       - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
-      # Grafana's own database: users, preferences, anything created in the UI.
       - grafana-data:/var/lib/grafana
     ports:
       - "${GRAFANA_PORT}:3000"
@@ -309,8 +296,7 @@ services:
 #
 #  The dataplatform network is declared in 01-kafka/docker-compose.yml and
 #  arrives through `include`. Declaring it again — even identically — makes
-#  Compose report a resource name conflict, because `include` copies
-#  definitions rather than merging them.
+#  Compose report a resource name conflict.
 # ----------------------------------------------------------------------------
 
 volumes:

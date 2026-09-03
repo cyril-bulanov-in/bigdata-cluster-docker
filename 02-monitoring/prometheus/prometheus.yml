@@ -1,9 +1,13 @@
 # ============================================================================
 #  Prometheus configuration
 # ============================================================================
-#  Five jobs: Prometheus itself, the JMX exporters in front of each broker, the
-#  host machine, the containers, and Kafka seen from the client side.
-#  Alerting rules live in their own file so this one stays readable.
+#  Targets arrive two ways:
+#
+#    static_configs   for the containers this stack owns and always starts
+#    docker_sd        for everything else, discovered by container label
+#
+#  The second one is why later stacks need no change to this file. See the
+#  docker-sd job at the bottom.
 #
 #  After editing this file:  make reload   (no restart, no data loss)
 # ============================================================================
@@ -25,7 +29,11 @@ global:
 #  Alerting rules
 # ----------------------------------------------------------------------------
 #  A glob, so a new file dropped into the directory is picked up by
-#  `make reload` without touching this config.
+#  `make reload` without touching this config. Later stacks add their rules
+#  as their own file here — for example rules/03-dbms.yml.
+#
+#  Rules for a stack that is not running are harmless: their expressions
+#  reference metrics that do not exist, so they simply never match.
 #
 #  There is no `alerting:` section pointing at an Alertmanager yet. Prometheus
 #  evaluates the rules and shows what is firing in its own UI; it simply has
@@ -62,32 +70,91 @@ scrape_configs:
         labels: { broker: kafka-4 }
 
   # ---- The host machine ----------------------------------------------------
-  # CPU, memory, disks, network, load average. One target, because there is one
-  # machine. On the Raspberry Pi cluster later there will be one per node.
   - job_name: node
     static_configs:
       - targets: ['node-exporter:9100']
         labels:
-          # Overrides the default instance label, which would otherwise be the
-          # container address. Useful the moment a second machine appears.
           instance: docker-host
 
   # ---- Individual containers ----------------------------------------------
-  # cAdvisor produces far more series than anything else here: several dozen
-  # per container, times every container running. A slower interval keeps the
-  # volume manageable without losing anything you would actually look at.
+  # cAdvisor produces far more series than anything else here. A slower
+  # interval keeps the volume manageable without losing anything useful.
   - job_name: cadvisor
     scrape_interval: 30s
     static_configs:
       - targets: ['cadvisor:8080']
 
   # ---- Kafka from the client side: offsets and consumer lag ---------------
-  # One target for the whole cluster, unlike the JMX exporters: this one speaks
-  # the Kafka protocol and asks the cluster as a whole rather than one JVM.
-  #
-  # Scraped less often on purpose. Every scrape makes the exporter query offsets
-  # for every partition of every topic, which is real work for the brokers.
   - job_name: kafka-lag
     scrape_interval: 30s
     static_configs:
       - targets: ['kafka-lag-exporter:9308']
+
+  # ==========================================================================
+  #  Everything else, discovered from Docker
+  # ==========================================================================
+  #  Why discovery rather than more static entries.
+  #
+  #  A static target for a container that is not always running is red
+  #  whenever that container is absent. Adding `postgres-exporter:9187` here
+  #  would make this stack fail its own smoke test when started on its own,
+  #  because a down target fires TargetDown. Every stack added later would
+  #  make the problem worse.
+  #
+  #  With discovery, Prometheus asks Docker what is running and scrapes only
+  #  containers that opted in. Nothing is red because nothing absent is
+  #  expected. A new exporter in any stack needs two labels on its service and
+  #  no change to this file:
+  #
+  #    labels:
+  #      prometheus.scrape: "true"
+  #      prometheus.port:   "9187"
+  #      prometheus.job:    "postgres"     # optional, defaults to docker-sd
+  #
+  #  Prometheus needs the Docker socket for this; see the compose file for how
+  #  it gets read access without running as root.
+  # ==========================================================================
+  - job_name: docker-sd
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        # How often to re-ask Docker what exists. Containers come and go
+        # rarely here, so 30s is plenty and costs nothing.
+        refresh_interval: 30s
+
+    relabel_configs:
+      # Docker reports one target per container per network. Without this the
+      # same exporter would be scraped once per network it belongs to.
+      - source_labels: [__meta_docker_network_name]
+        regex: dataplatform
+        action: keep
+
+      # Opt-in. Containers without the label are dropped here and never
+      # scraped — which is what keeps this from discovering Kafka brokers,
+      # Grafana and everything else that has no /metrics endpoint.
+      - source_labels: [__meta_docker_container_label_prometheus_scrape]
+        regex: "true"
+        action: keep
+
+      # Docker gives the container's IP with the port it exposes, which is
+      # rarely the metrics port. Replace the port with the one the label
+      # declares, keeping the discovered IP.
+      - source_labels: [__address__, __meta_docker_container_label_prometheus_port]
+        regex: '([^:]+)(?::\d+)?;(\d+)'
+        replacement: '$1:$2'
+        target_label: __address__
+
+      # Use the declared job name, so metrics land under `postgres` rather
+      # than all sharing the label `docker-sd`.
+      - source_labels: [__meta_docker_container_label_prometheus_job]
+        regex: '(.+)'
+        target_label: job
+
+      # Container names come back with a leading slash: /postgres-exporter.
+      - source_labels: [__meta_docker_container_name]
+        regex: '/(.*)'
+        target_label: container
+
+      # A readable instance label. Without this it is an IP that changes on
+      # every recreate, and every graph legend becomes unreadable.
+      - source_labels: [container]
+        target_label: instance
