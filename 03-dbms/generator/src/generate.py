@@ -7,8 +7,8 @@ Two modes:
 
 Plain SQL through psycopg, no ORM. The point of this file is that a reader can
 see exactly which statements hit the database, because those statements are
-what Debezium will turn into change events later. An ORM would hide precisely
-the part that matters here.
+what Debezium turns into change events. An ORM would hide precisely the part
+that matters here.
 
 Every rate is an environment variable, so the shape of the load can be changed
 without rebuilding the image. See .env.example.
@@ -20,10 +20,8 @@ import random
 import signal
 import sys
 import time
-from datetime import datetime, timezone
 
 import psycopg
-from psycopg import sql
 
 # ---------------------------------------------------------------------------
 #  Configuration
@@ -119,51 +117,94 @@ def connect(retries: int = 60, delay: float = 2.0) -> psycopg.Connection:
 #  Seed
 # ---------------------------------------------------------------------------
 def seed(conn: psycopg.Connection) -> None:
+    """Fill the reference tables, one table at a time.
+
+    Each table is checked and filled independently, and that is the whole
+    point of the design.
+
+    An earlier version asked only "are there any customers?" and returned
+    early if there were. That looked reasonable and was a race: the churn
+    container starts at the same time as this one and inserts a customer of
+    its own within seconds. Seed then found those customers, concluded the
+    database was populated, and exited without ever inserting a product.
+
+    The consequence was silent and looked nothing like its cause. create_order
+    picks random active products, found none, and returned without creating
+    anything — so orders stayed at zero forever while customers slowly grew.
+    Downstream, Debezium snapshotted an almost-empty database and created a
+    single topic instead of four, and every check that depended on orders
+    failed with no error anywhere to explain why.
+    """
     with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM products")
+        have_products = cur.fetchone()[0]
         cur.execute("SELECT count(*) FROM customers")
-        existing = cur.fetchone()[0]
-        if existing:
-            print(f"already seeded: {existing} customers, nothing to do", flush=True)
+        have_customers = cur.fetchone()[0]
+
+        # The customer threshold is a comparison, not a truthiness check: a
+        # handful of customers created by churn must not count as seeded.
+        if have_products and have_customers >= SEED_CUSTOMERS:
+            print(
+                f"already seeded: {have_customers} customers, "
+                f"{have_products} products, nothing to do",
+                flush=True,
+            )
             return
 
-        # executemany in one transaction rather than one INSERT per row.
-        # Two thousand separate commits would also produce two thousand
-        # separate WAL flushes, which is slow for no reason.
-        customers = [
-            (
-                f"user{i:05d}@example.com",
-                f"{random.choice(FIRST)} {random.choice(LAST)}",
-                random.choice(COUNTRIES),
+        if have_customers < SEED_CUSTOMERS:
+            # executemany in one transaction rather than one INSERT per row.
+            # Two thousand separate commits would also mean two thousand
+            # separate WAL flushes, which is slow for no reason.
+            customers = [
+                (
+                    f"user{i:05d}@example.com",
+                    f"{random.choice(FIRST)} {random.choice(LAST)}",
+                    random.choice(COUNTRIES),
+                )
+                for i in range(SEED_CUSTOMERS)
+            ]
+            cur.executemany(
+                "INSERT INTO customers (email, full_name, country_code) "
+                "VALUES (%s, %s, %s) ON CONFLICT (email) DO NOTHING",
+                customers,
             )
-            for i in range(SEED_CUSTOMERS)
-        ]
-        cur.executemany(
-            "INSERT INTO customers (email, full_name, country_code) VALUES (%s, %s, %s)",
-            customers,
-        )
-        print(f"inserted {len(customers)} customers", flush=True)
+            print(f"inserted up to {len(customers)} customers", flush=True)
+        else:
+            print(f"customers already present: {have_customers}", flush=True)
 
-        products = [
-            (
-                f"SKU-{i:05d}",
-                f"{random.choice(ADJECTIVES)} {random.choice(NOUNS)}",
-                random.choice(CATEGORIES),
-                round(random.lognormvariate(4.0, 0.7), 2),
+        if not have_products:
+            products = [
+                (
+                    f"SKU-{i:05d}",
+                    f"{random.choice(ADJECTIVES)} {random.choice(NOUNS)}",
+                    random.choice(CATEGORIES),
+                    round(random.lognormvariate(4.0, 0.7), 2),
+                )
+                for i in range(SEED_PRODUCTS)
+            ]
+            cur.executemany(
+                "INSERT INTO products (sku, name, category, price) "
+                "VALUES (%s, %s, %s, %s) ON CONFLICT (sku) DO NOTHING",
+                products,
             )
-            for i in range(SEED_PRODUCTS)
-        ]
-        cur.executemany(
-            "INSERT INTO products (sku, name, category, price) VALUES (%s, %s, %s, %s)",
-            products,
-        )
-        print(f"inserted {len(products)} products", flush=True)
+            print(f"inserted {len(products)} products", flush=True)
+        else:
+            print(f"products already present: {have_products}", flush=True)
 
 
 # ---------------------------------------------------------------------------
 #  Individual mutations
 # ---------------------------------------------------------------------------
 def create_order(cur) -> bool:
-    """One order with one to five items. Produces INSERTs only."""
+    """One order with one to five items.
+
+    Two statements against orders on purpose: an INSERT, then an UPDATE
+    setting the total once the items are known. That is how order systems
+    actually behave — a row is created and then completed — and it means every
+    order produces both a 'c' and a 'u' event, which is what makes the
+    deduplication downstream worth testing on real traffic rather than on a
+    contrived example.
+    """
     cur.execute("SELECT customer_id FROM customers ORDER BY random() LIMIT 1")
     row = cur.fetchone()
     if row is None:
@@ -176,6 +217,7 @@ def create_order(cur) -> bool:
     )
     picked = cur.fetchall()
     if not picked:
+        # No products means no orders, ever. Seeding has to have run.
         return False
 
     cur.execute(
@@ -194,8 +236,6 @@ def create_order(cur) -> bool:
             (order_id, product_id, qty, price),
         )
 
-    # A second statement against orders, so every order produces at least one
-    # UPDATE as well as its INSERT.
     cur.execute(
         "UPDATE orders SET total_amount = %s, updated_at = now() WHERE order_id = %s",
         (round(total, 2), order_id),
@@ -246,7 +286,8 @@ def update_price(cur) -> bool:
 
 def new_customer(cur) -> bool:
     cur.execute(
-        "INSERT INTO customers (email, full_name, country_code) VALUES (%s, %s, %s)",
+        "INSERT INTO customers (email, full_name, country_code) VALUES (%s, %s, %s) "
+        "ON CONFLICT (email) DO NOTHING",
         (
             f"user{int(time.time() * 1000) % 10**9}@example.com",
             f"{random.choice(FIRST)} {random.choice(LAST)}",
@@ -288,6 +329,7 @@ def churn(conn: psycopg.Connection) -> None:
 
     counts = {"orders": 0, "advances": 0, "prices": 0, "customers": 0, "deletes": 0}
     last_report = time.monotonic()
+    warned_empty = False
 
     while not _stop:
         cycle_start = time.monotonic()
@@ -295,6 +337,18 @@ def churn(conn: psycopg.Connection) -> None:
             with conn.cursor() as cur:
                 if create_order(cur):
                     counts["orders"] += 1
+                elif not warned_empty:
+                    # Loud once, rather than a silent zero forever. Orders that
+                    # never appear because the catalogue is empty look exactly
+                    # like a generator that is not running.
+                    cur.execute("SELECT count(*) FROM products WHERE is_active")
+                    if cur.fetchone()[0] == 0:
+                        print(
+                            "no active products — orders cannot be created. "
+                            "Run the seed step: make seed",
+                            flush=True,
+                        )
+                        warned_empty = True
                 if random.random() < P_ADVANCE_ORDER and advance_order(cur):
                     counts["advances"] += 1
                 if random.random() < P_UPDATE_PRICE and update_price(cur):

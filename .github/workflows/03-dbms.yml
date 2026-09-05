@@ -1,7 +1,6 @@
 # Boots the source database, change capture and the broker on a clean runner
 # and checks that changes actually flow. The warehouse is deliberately absent —
-# see the "What continuous integration does not cover" section of
-# 03-dbms/README.md.
+# see "What continuous integration does not cover" in 03-dbms/README.md.
 #
 # Triggered by changes to 01-kafka and 02-monitoring as well, because this
 # stack includes both: a change to either can break it without touching a
@@ -48,15 +47,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Show Docker versions
+      - name: Show Docker versions and memory
         run: |
-          docker --version
           docker compose version
-
-      - name: Show available memory
-        # Nineteen containers on a 16 GiB runner. Printing this makes an
-        # out-of-memory kill diagnosable instead of mysterious.
-        run: free -h
+          free -h
 
       # Three .env files, one per stack in the include chain. Each is read
       # from its own directory by the compose file that lives there.
@@ -69,10 +63,10 @@ jobs:
           # Connect limits are lowered; every image version stays exactly as
           # pinned, so CI tests the same versions that run locally.
           #
-          # The container limit is set well above the heap on purpose: a JVM
-          # allocates plenty outside it, and a broker sitting at 90% of its
-          # limit would trip ContainerNearMemoryLimit and turn a healthy run
-          # red on a rule that is doing its job.
+          # The container limit sits well above the heap on purpose: a JVM
+          # allocates plenty outside it, and a broker at 90% of its limit would
+          # trip ContainerNearMemoryLimit and turn a healthy run red on a rule
+          # that is doing its job.
           sed -i 's/^KAFKA_HEAP_OPTS=.*/KAFKA_HEAP_OPTS=-Xms256m -Xmx512m/' ../01-kafka/.env
           sed -i 's/^KAFKA_MEM_LIMIT=.*/KAFKA_MEM_LIMIT=1500m/' ../01-kafka/.env
           sed -i 's/^CONNECT_HEAP_OPTS=.*/CONNECT_HEAP_OPTS=-Xms256m -Xmx768m/' .env
@@ -83,40 +77,60 @@ jobs:
       - name: Start everything except the warehouse
         run: make up-light
 
+      # Seeding is what create_order depends on: with no products it silently
+      # creates no orders, and every check below fails with nothing in the logs
+      # to explain why. Printing the result makes that visible immediately.
+      - name: Confirm the reference data is present
+        run: |
+          make seed
+          docker compose exec -T postgres psql -U app -d shop -t -A \
+            -c "SELECT 'products=' || count(*) FROM products" \
+            -c "SELECT 'customers=' || count(*) FROM customers"
+
       - name: Register the Debezium connector
-        # The script waits for the Connect REST API and for the Postgres
-        # plugin to be loaded, so no sleep is needed before this.
+        # The script waits for the Connect REST API and for the Postgres plugin
+        # to load, so no sleep is needed before this.
         run: make connector
 
       - name: Let capture settle
-        # Debezium takes an initial snapshot of four tables before it starts
-        # streaming, and the smoke test asserts that topics exist and hold
-        # messages. Thirty seconds is comfortably more than the snapshot needs
-        # at this data volume.
+        # Debezium snapshots four tables before it starts streaming, and the
+        # smoke test asserts that topics exist and hold messages.
         run: sleep 30
 
       - name: Smoke test, without the warehouse
         run: make smoke
 
+      # Scoped deliberately. Dumping every container's log produced thousands
+      # of lines of Kafka partition bookkeeping that buried the one message
+      # that mattered.
       - name: Dump diagnostics on failure
         if: failure()
         run: |
           echo "=== container status ==="
           docker compose ps -a
           echo ""
+          echo "=== row counts ==="
+          docker compose exec -T postgres psql -U app -d shop -c \
+            "SELECT 'customers' t, count(*) FROM customers
+             UNION ALL SELECT 'products', count(*) FROM products
+             UNION ALL SELECT 'orders', count(*) FROM orders" || true
+          echo ""
           echo "=== connector status ==="
           curl -fsS "http://localhost:8083/connectors/postgres-source/status" || true
           echo ""
           echo "=== replication slot ==="
           docker compose exec -T postgres psql -U app -d shop -c \
-            "SELECT slot_name, active, plugin FROM pg_replication_slots" || true
+            "SELECT slot_name, active FROM pg_replication_slots" || true
           echo ""
           echo "=== cdc topics ==="
           docker compose exec -T kafka-1 /opt/kafka/bin/kafka-topics.sh \
             --bootstrap-server kafka-1:9092 --list | grep '^cdc\.' || true
           echo ""
-          echo "=== logs ==="
-          docker compose logs --no-color --tail=150
+          echo "=== generator (the usual culprit) ==="
+          docker compose logs --no-color --tail=30 generator || true
+          echo ""
+          echo "=== kafka-connect ==="
+          docker compose logs --no-color --tail=40 kafka-connect | grep -viE 'INFO.*(Truncating|UnifiedLog|GroupCoordinator)' || true
 
       - name: Tear down
         if: always()

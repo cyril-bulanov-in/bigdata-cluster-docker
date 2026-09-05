@@ -210,11 +210,18 @@ read_msgs=$(ch_q "SELECT sum(num_messages_read) FROM clusterAllReplicas('platfor
   && pass "${read_msgs} messages read from Kafka" \
   || fail "${read_msgs:-0} messages read — the queues are subscribed but not consuming"
 
-# The column is a nested array, exceptions.text, not last_exception.
-errs=$(ch_q "SELECT count() FROM clusterAllReplicas('platform', system.kafka_consumers) WHERE notEmpty(\`exceptions.text\`) SETTINGS skip_unavailable_shards = 1")
+# Only exceptions from the last two minutes count.
+#
+# system.kafka_consumers keeps the last ten exceptions per consumer forever,
+# and a queue created before Debezium has produced its topics always records
+# "Broker: Unknown topic or partition" on its first polls. Reading normally
+# afterwards does not clear it. Asking "were there ever errors" therefore
+# fails on every clean start; asking "are there errors now" is the question
+# that was meant.
+errs=$(ch_q "SELECT count() FROM clusterAllReplicas('platform', system.kafka_consumers) WHERE arrayExists(t -> t > now() - INTERVAL 2 MINUTE, \`exceptions.time\`) SETTINGS skip_unavailable_shards = 1")
 [ "${errs:-1}" = "0" ] \
-  && pass "no consumer exceptions" \
-  || fail "${errs} consumer(s) with exceptions — see: make ch-queues"
+  && pass "no recent consumer exceptions" \
+  || fail "${errs} consumer(s) erroring in the last 2 minutes — see: make ch-queues"
 
 # products is the table to compare on, and the comparison is exact.
 #
