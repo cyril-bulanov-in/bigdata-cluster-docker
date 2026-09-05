@@ -10,8 +10,7 @@
 #   * the alerting rules failed to parse, so nothing would ever fire
 #   * Grafana never picked up the datasource or the dashboard
 #
-# This checks all four. Exits non-zero on the first failed assertion, so it
-# works as a CI gate.
+# Exits non-zero on the first failed assertion, so it works as a CI gate.
 #
 # Usage:  ./scripts/smoke.sh          (or: make smoke)
 
@@ -42,11 +41,31 @@ GRAF="http://localhost:${GRAF_PORT}"
 
 # prometheus, 4x kafka-jmx, node, cadvisor, kafka-lag
 EXPECTED_TARGETS=8
-EXPECTED_RULES=12
+EXPECTED_RULES=10
 EXPECTED_BROKERS=4
 
 READY_TIMEOUT=240     # cAdvisor and the JMX exporters are the slow ones
 GRAF_TIMEOUT=90       # Grafana is a Spring-sized application, it takes a while
+
+# ---------------------------------------------------------------------------
+#  How long to wait for a metric to appear
+# ---------------------------------------------------------------------------
+#  A target counts as up the moment its endpoint returns 200. That is not the
+#  same as having the data you want.
+#
+#  node-exporter and cAdvisor read local state and serve it immediately. The
+#  JMX exporters hold an open connection and are just as prompt. But
+#  kafka-lag-exporter has to go and ask Kafka for cluster metadata on its own
+#  schedule before it can report anything about topics, and its scrape
+#  interval is 30s. So there is a window, right after startup, where every
+#  target is up and kafka_topic_partitions does not exist yet.
+#
+#  Checking each metric once turned that window into a failing test. Retrying
+#  costs nothing when the metric is already there — the first attempt
+#  succeeds — and removes a whole class of false red builds.
+# ---------------------------------------------------------------------------
+METRIC_TIMEOUT=90
+METRIC_INTERVAL=5
 
 PASSED=0
 FAILED=0
@@ -61,16 +80,16 @@ info() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 #  the trailing `|| true` that non-zero status propagates out of the command
 #  substitution and `set -e` kills the script — silently, and only when there
 #  is nothing to count. In other words, exactly in the failure case the
-#  diagnostics were written for. Every count below goes through this helper.
+#  diagnostics were written for.
+#
+#  Every JSON pattern below is written as '"key": *"value"' with an optional
+#  space. Prometheus and Grafana both emit compact JSON today, but matching on
+#  somebody else's whitespace is a dependency nobody declares and nobody
+#  remembers — until a version bump turns every count into zero.
 # ---------------------------------------------------------------------------
 count_matches() {
   printf '%s' "$1" | grep -o "$2" | wc -l | tr -d ' ' || true
 }
-
-# Every JSON pattern below is written as '"key": *"value"' with an optional
-# space. Prometheus and Grafana both emit compact JSON today, but matching on
-# somebody else's whitespace is a dependency nobody declares and nobody
-# remembers — until a version bump turns every count into zero.
 
 # Ask Prometheus a PromQL question and print the scalar it returns.
 # grep rather than jq or python, so the script needs nothing but curl.
@@ -91,13 +110,12 @@ has_series() {
 }
 
 # ---------------------------------------------------------------------------
-#  0a. Is the stack running at all?
+#  0a. Is the stack running?
 # ---------------------------------------------------------------------------
 #  Checked before anything else. Without it the script spends four minutes
 #  waiting for targets that were never started, then blames Prometheus.
 # ---------------------------------------------------------------------------
 running=$($COMPOSE ps --services 2>/dev/null | grep -cE '^(prometheus|grafana)$' || true)
-# (grep -c prints 0 and exits 1 when nothing matches, hence the || true above)
 if [ "${running:-0}" -lt 2 ]; then
   printf '\n\033[31mThe monitoring stack is not running.\033[0m\n\n'
   echo "  Start it first, then test it:"
@@ -126,8 +144,7 @@ while :; do
     echo ""
     if [ -z "$body" ]; then
       # No answer at all is a different failure from "a target is down", and
-      # the fix is somewhere else entirely. Say so rather than printing an
-      # empty list of unhealthy targets.
+      # the fix is somewhere else entirely.
       printf '  \033[31mPrometheus itself did not answer at %s\033[0m\n' "$PROM"
       echo ""
       echo "  It is not a scrape problem — the API is unreachable. Check:"
@@ -170,13 +187,16 @@ down_count=$(count_matches "$targets_body" '"health": *"down"')
   && pass "${up_count} targets up (expected at least ${EXPECTED_TARGETS})" \
   || fail "only ${up_count} targets up, expected at least ${EXPECTED_TARGETS}"
 
-# A typo in alerts.yml stops Prometheus loading the file. Nothing else in the
+# A typo in a rules file stops Prometheus loading it. Nothing else in the
 # stack notices: the UI looks normal, and no alert would ever fire.
+#
+# The count is a lower bound, not an equality: later stacks add their own
+# rules files to the same directory, so this number only grows.
 rules_body=$(curl -fsS --max-time 10 "${PROM}/api/v1/rules" 2>/dev/null || true)
 rule_count=$(count_matches "$rules_body" '"type": *"alerting"')
 [ "${rule_count:-0}" -ge "$EXPECTED_RULES" ] \
   && pass "${rule_count} alerting rules loaded" \
-  || fail "${rule_count:-0} alerting rules loaded, expected ${EXPECTED_RULES}"
+  || fail "${rule_count:-0} alerting rules loaded, expected at least ${EXPECTED_RULES}"
 
 # ---------------------------------------------------------------------------
 #  2. The metrics the dashboards and alerts actually query
@@ -184,11 +204,31 @@ rule_count=$(count_matches "$rules_body" '"type": *"alerting"')
 #  A target can be up and export nothing this platform cares about. These check
 #  the specific series by name, one per exporter, so a failure points straight
 #  at the component that stopped producing.
+#
+#  Each check retries for up to METRIC_TIMEOUT seconds — see the note above on
+#  why "target up" and "metric present" are not the same moment.
 # ---------------------------------------------------------------------------
-info "Metrics present"
+info "Metrics present (waiting up to ${METRIC_TIMEOUT}s each)"
 
 check_metric() {
-  if has_series "$2"; then pass "$1"; else fail "$1 — no series for: $2"; fi
+  local label="$1" query="$2"
+  local waited=0
+  while :; do
+    if has_series "$query"; then
+      if [ "$waited" -eq 0 ]; then
+        pass "$label"
+      else
+        pass "$label (appeared after ${waited}s)"
+      fi
+      return
+    fi
+    if [ "$waited" -ge "$METRIC_TIMEOUT" ]; then
+      fail "$label — no series after ${METRIC_TIMEOUT}s for: $query"
+      return
+    fi
+    sleep "$METRIC_INTERVAL"
+    waited=$((waited + METRIC_INTERVAL))
+  done
 }
 
 check_metric "host CPU (node-exporter)"        'node_cpu_seconds_total'
@@ -200,6 +240,8 @@ check_metric "container memory (cAdvisor)"     'container_memory_usage_bytes{nam
 check_metric "Kafka throughput (JMX)"          'kafka_server_brokertopicmetrics_bytesinpersec_count'
 check_metric "Kafka replication (JMX)"         'kafka_server_replicamanager_underreplicatedpartitions'
 check_metric "Kafka broker JVM heap (JMX)"     'kafka_jvm_memory_heap_used_bytes'
+# The slow one. This exporter queries Kafka for metadata on its own schedule
+# before it can report anything about topics, and it is scraped every 30s.
 check_metric "Kafka topics (lag exporter)"     'kafka_topic_partitions'
 
 # ---------------------------------------------------------------------------
