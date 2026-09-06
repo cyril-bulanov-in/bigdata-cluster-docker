@@ -35,7 +35,7 @@ concurrency:
 jobs:
   smoke:
     runs-on: ubuntu-latest
-    # Longer than the other stacks: this one builds two images and starts
+    #  Longer than the other stacks: this one builds two images and starts
     # twenty-six containers, and Airflow's first start runs a schema
     # migration before anything else can begin.
     timeout-minutes: 40
