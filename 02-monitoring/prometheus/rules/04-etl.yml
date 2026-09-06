@@ -1,0 +1,100 @@
+# ============================================================================
+#  Alerting rules for the 04-etl stack
+# ============================================================================
+#  Lives here because Prometheus mounts one rules directory and each stack
+#  contributes a file named after itself. Rules for a stack that is not
+#  running reference metrics that do not exist, match nothing, and stay
+#  inactive.
+#
+#  ---------------------------------------------------------------------------
+#  Verify the metric names before trusting any of this
+#  ---------------------------------------------------------------------------
+#  Airflow speaks StatsD; the exporter renames everything on the way through,
+#  and the names below depend on both Airflow's own naming and on
+#  04-etl/statsd/mapping.yml. A rule naming a metric that does not exist never
+#  fires and never complains — it just sits in the UI looking like coverage.
+#
+#      curl -s 'http://localhost:9090/api/v1/label/__name__/values' \
+#        | tr ',' '\n' | grep airflow_
+#
+#  If a name below is absent from that list, the rule is decoration. Fix the
+#  name or delete the rule; leaving it is worse than having neither.
+# ============================================================================
+
+groups:
+
+  - name: airflow
+    rules:
+
+      # The exporter itself. Without it every rule below goes quiet, which
+      # would otherwise look like a perfectly healthy Airflow.
+      - alert: AirflowMetricsMissing
+        expr: up{job="airflow"} == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The Airflow statsd exporter is not being scraped"
+          description: "Every other Airflow alert is blind while this is true."
+
+      # The scheduler emits a heartbeat continuously. A flat counter means it
+      # has stopped scheduling — while the UI stays up and answers normally,
+      # because that is a different process. Nothing gets queued, and nothing
+      # says so.
+      - alert: AirflowSchedulerNotHeartbeating
+        expr: rate(airflow_scheduler_heartbeat[5m]) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The Airflow scheduler has stopped heartbeating"
+          description: "The UI will look fine. Nothing is being scheduled."
+
+      # Any failed task. On this platform every DAG except the deliberate
+      # smoke test is expected to succeed, so a failure is worth surfacing
+      # immediately rather than at the next glance at the UI.
+      #
+      # The smoke DAG fails on purpose, so it is excluded by name — otherwise
+      # this alert would be permanently firing and would teach everyone to
+      # ignore it.
+      - alert: AirflowTaskFailed
+        expr: increase(airflow_task_finish_total{state="failed",dag_id!="00_docker_smoke"}[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.dag_id }}.{{ $labels.task_id }} failed"
+
+      # The gap between when a run should have started and when it did. This
+      # is the number that says the scheduler is falling behind, as opposed to
+      # a single slow task.
+      - alert: AirflowScheduleDelayHigh
+        expr: airflow_dagrun_schedule_delay_seconds > 300
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.dag_id }} started {{ $value | printf \"%.0f\" }}s late"
+
+      # A DAG file that fails to import does not appear in the UI at all.
+      # There is no broken entry, no warning banner — it is simply absent,
+      # which looks exactly like a file nobody has written yet.
+      - alert: AirflowDagImportErrors
+        expr: airflow_dag_processing_import_errors > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} DAG file(s) failing to import"
+          description: "They are missing from the UI with no other sign. Check: make dag-errors"
+
+      # Tasks that are ready to run and have nowhere to run. Persistent
+      # starvation means the pool or the parallelism limit is the bottleneck,
+      # not the work.
+      - alert: AirflowTasksStarving
+        expr: airflow_scheduler_tasks_starving > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} task(s) waiting for a slot for 15 minutes"

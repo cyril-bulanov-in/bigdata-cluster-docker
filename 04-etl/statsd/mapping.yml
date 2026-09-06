@@ -1,0 +1,54 @@
+# ============================================================================
+#  StatsD to Prometheus mapping
+# ============================================================================
+#  Airflow emits StatsD, not Prometheus. This exporter receives those metrics
+#  over UDP and republishes them as a scrape endpoint.
+#
+#  Without a mapping, a metric like
+#      airflow.dag.my_dag.my_task.duration
+#  becomes a distinct Prometheus metric name per DAG and per task — thousands
+#  of names, none of which can be aggregated. The rules below turn the moving
+#  parts into labels instead.
+#
+#  Rules are tried in order and the first match wins, so the specific ones
+#  come before the catch-all.
+# ============================================================================
+mappings:
+
+  # Task instance outcomes, per DAG and task.
+  - match: "airflow.ti.finish.*.*.*"
+    name: "airflow_task_finish_total"
+    labels:
+      dag_id: "$1"
+      task_id: "$2"
+      state: "$3"
+
+  # How long a task took.
+  - match: "airflow.dag.*.*.duration"
+    name: "airflow_task_duration_seconds"
+    labels:
+      dag_id: "$1"
+      task_id: "$2"
+
+  # How long a whole DAG run took.
+  - match: "airflow.dagrun.duration.success.*"
+    name: "airflow_dagrun_duration_success_seconds"
+    labels:
+      dag_id: "$1"
+  - match: "airflow.dagrun.duration.failed.*"
+    name: "airflow_dagrun_duration_failed_seconds"
+    labels:
+      dag_id: "$1"
+
+  # The gap between when a run was scheduled and when it actually started.
+  # This is the number that tells you the scheduler is falling behind.
+  - match: "airflow.dagrun.schedule_delay.*"
+    name: "airflow_dagrun_schedule_delay_seconds"
+    labels:
+      dag_id: "$1"
+
+  # Anything else keeps its name with dots turned into underscores. Better a
+  # slightly ugly name than a dropped metric.
+  - match: "airflow.(.+)"
+    match_type: regex
+    name: "airflow_$1"

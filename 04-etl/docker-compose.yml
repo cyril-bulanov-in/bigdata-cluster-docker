@@ -1,0 +1,258 @@
+# ============================================================================
+#  PLATFORM — step 4: orchestration (part 1 of N — Airflow itself)
+# ============================================================================
+#
+#  Airflow with its own metadata database. No DAGs yet: this part is about
+#  getting the four Airflow components running and reporting metrics.
+#
+#  Start:  make up
+#  UI:     http://localhost:8081
+#
+# ----------------------------------------------------------------------------
+#  Why Airflow 3 needs four containers
+# ----------------------------------------------------------------------------
+#  Airflow 2 ran a webserver and a scheduler. Airflow 3 splits the work:
+#
+#    api-server     the UI and the REST API, and the execution API that tasks
+#                   call back into. Formerly "webserver".
+#    scheduler      decides what to run and, with LocalExecutor, runs it.
+#    dag-processor  parses DAG files. A separate process in Airflow 3, not an
+#                   option: the scheduler no longer imports DAG code, so a
+#                   syntax error in a DAG cannot take the scheduler down.
+#    triggerer      runs deferred tasks — the ones that wait on something
+#                   without occupying a worker slot.
+#
+#  LocalExecutor rather than Celery: no Redis, no separate workers, and the
+#  tasks here start containers rather than doing work themselves, so a worker
+#  process is mostly a supervisor for a `docker run`.
+# ----------------------------------------------------------------------------
+include:
+  - ../03-dbms/docker-compose.yml
+
+name: platform
+
+# ----------------------------------------------------------------------------
+#  Settings shared by every Airflow component
+# ----------------------------------------------------------------------------
+#  All four run the same image and need the same configuration. They differ
+#  only in the command they run.
+# ----------------------------------------------------------------------------
+x-airflow: &airflow
+  build:
+    context: ./airflow
+    args:
+      AIRFLOW_VERSION: ${AIRFLOW_VERSION}
+  image: dataplatform/airflow:${AIRFLOW_VERSION}
+  restart: unless-stopped
+  networks: [dataplatform]
+  environment:
+    # ---- metadata database ------------------------------------------------
+    # Its own Postgres, not the one in 03-dbms. That one is the operational
+    # source being captured; Airflow's bookkeeping has no business appearing
+    # in the change stream, and a schema migration on one must never touch
+    # the other.
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
+      postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@airflow-postgres:5432/${AIRFLOW_DB_NAME}
+
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+
+    # Encrypts connection passwords and variables in the metadata database.
+    # Changing it makes every stored secret unreadable, which is why it is
+    # pinned in .env rather than generated at startup.
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__API__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
+        # Signs the tokens tasks use to call the execution API. Every component
+    # must share it: the scheduler issues the token, the api-server verifies
+    # it, and without a fixed value each generates its own key. The task then
+    # fails with "Invalid auth token" before its operator ever runs — which
+    # looks like a DockerOperator problem and is not.
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET}
+
+    # Where tasks call back to report their state. Airflow 3 runs tasks
+    # against this API rather than letting them write to the database
+    # directly — the change that made a separate api-server necessary.
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+
+    # ---- authentication ---------------------------------------------------
+    # No login at all. Every request is treated as an authenticated admin.
+    #
+    # This is deliberate, and the alternative is worse for a local stand.
+    # SimpleAuthManager's `simple_auth_manager_users` setting takes
+    # `username:role` — it cannot set a password. Passwords are always
+    # generated into a JSON file inside the container, so the only way to log
+    # in is to read that file out of the log, and the value changes every time
+    # the volume is recreated. A stand that hands you a different random
+    # password after every `make clean` is not a stand, it is a chore.
+    #
+    # What this costs: anything that can reach port 8081 has full control of
+    # Airflow. Acceptable while that is only this machine. Before exposing it
+    # anywhere, switch to the FAB auth manager, or point
+    # AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_PASSWORDS_FILE at a writable file
+    # holding {"admin": "..."} — note it is opened read-write, so a read-only
+    # mount will not do.
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
+
+    # ---- metrics ----------------------------------------------------------
+    # Airflow speaks StatsD, not Prometheus. The exporter below translates.
+    AIRFLOW__METRICS__STATSD_ON: "true"
+    AIRFLOW__METRICS__STATSD_HOST: airflow-statsd
+    AIRFLOW__METRICS__STATSD_PORT: "9125"
+    AIRFLOW__METRICS__STATSD_PREFIX: airflow
+
+    # Keeps the UI clock and log timestamps in one timezone.
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: UTC
+
+  volumes:
+    - ./dags:/opt/airflow/dags:ro
+    - airflow-logs:/opt/airflow/logs
+
+  depends_on:
+    airflow-postgres:
+      condition: service_healthy
+
+services:
+
+  # ==========================================================================
+  #  Airflow's metadata database
+  # ==========================================================================
+  airflow-postgres:
+    image: postgres:${POSTGRES_VERSION}
+    container_name: airflow-postgres
+    restart: unless-stopped
+    networks: [dataplatform]
+    environment:
+      POSTGRES_DB: ${AIRFLOW_DB_NAME}
+      POSTGRES_USER: ${AIRFLOW_DB_USER}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+    volumes:
+      - airflow-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AIRFLOW_DB_USER} -d ${AIRFLOW_DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # ==========================================================================
+  #  One-shot: create the schema
+  # ==========================================================================
+  #  Runs to completion and exits. Every other component waits for it, so
+  #  none of them races the migration.
+  # ==========================================================================
+  airflow-init:
+    <<: *airflow
+    container_name: airflow-init
+    restart: "no"
+    command: ["db", "migrate"]
+
+  # ==========================================================================
+  #  The UI, the REST API, and the execution API
+  # ==========================================================================
+  airflow-apiserver:
+    <<: *airflow
+    container_name: airflow-apiserver
+    command: ["api-server"]
+    ports:
+      - "${AIRFLOW_PORT}:8080"
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/api/v2/monitor/health || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  # ==========================================================================
+  #  The scheduler — and, with LocalExecutor, the thing that runs tasks
+  # ==========================================================================
+  #  It gets the Docker socket because DockerOperator will start containers
+  #  from here. group_add rather than running as root: the socket is
+  #  root:root mode 660, and adding group 0 grants exactly that access and
+  #  nothing else.
+  # ==========================================================================
+  airflow-scheduler:
+    <<: *airflow
+    container_name: airflow-scheduler
+    command: ["scheduler"]
+    group_add:
+      - "0"
+    volumes:
+      - ./dags:/opt/airflow/dags:ro
+      - airflow-logs:/opt/airflow/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\" || exit 1"]
+      interval: 30s
+      timeout: 20s
+      retries: 6
+      start_period: 60s
+
+  # ==========================================================================
+  #  The DAG processor
+  # ==========================================================================
+  #  Parses the files in ./dags. Separate from the scheduler in Airflow 3, so
+  #  a DAG that fails to import cannot stop scheduling for everything else.
+  # ==========================================================================
+  airflow-dag-processor:
+    <<: *airflow
+    container_name: airflow-dag-processor
+    command: ["dag-processor"]
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ==========================================================================
+  #  The triggerer — deferred tasks
+  # ==========================================================================
+  airflow-triggerer:
+    <<: *airflow
+    container_name: airflow-triggerer
+    command: ["triggerer"]
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ==========================================================================
+  #  StatsD to Prometheus
+  # ==========================================================================
+  #  Discovered by label, like every exporter added since 02-monitoring.
+  # ==========================================================================
+  airflow-statsd:
+    image: prom/statsd-exporter:${STATSD_EXPORTER_VERSION}
+    container_name: airflow-statsd
+    restart: unless-stopped
+    networks: [dataplatform]
+    command:
+      - '--statsd.mapping-config=/etc/statsd/mapping.yml'
+      - '--statsd.listen-udp=:9125'
+      - '--web.listen-address=:9102'
+    volumes:
+      - ./statsd/mapping.yml:/etc/statsd/mapping.yml:ro
+    labels:
+      prometheus.scrape: "true"
+      prometheus.port: "9102"
+      prometheus.job: "airflow"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9102/metrics >/dev/null 2>&1 || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 6
+      start_period: 15s
+
+volumes:
+  airflow-postgres-data:
+  airflow-logs:

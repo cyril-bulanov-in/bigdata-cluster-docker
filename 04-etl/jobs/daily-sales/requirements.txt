@@ -1,0 +1,4 @@
+# The HTTP interface and nothing else. A ClickHouse driver would be one more
+# dependency to pin, and the job sends four statements — the protocol is not
+# the interesting part here.
+requests==2.32.3

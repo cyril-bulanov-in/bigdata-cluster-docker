@@ -1,0 +1,129 @@
+# Boots the platform without the ClickHouse cluster, starts Airflow, and
+# checks that the orchestration works: components up, DAGs parsed, job images
+# built, metrics flowing.
+#
+# The mart job and its output are covered locally — see
+# "What continuous integration does not cover" in 04-etl/README.md.
+#
+# Triggered by every stack this one includes, because a change to any of them
+# can break it without touching a file here.
+
+name: 04-etl
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '04-etl/**'
+      - '03-dbms/**'
+      - '02-monitoring/**'
+      - '01-kafka/**'
+      - '.github/workflows/04-etl.yml'
+  pull_request:
+    paths:
+      - '04-etl/**'
+      - '03-dbms/**'
+      - '02-monitoring/**'
+      - '01-kafka/**'
+      - '.github/workflows/04-etl.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: 04-etl-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    # Longer than the other stacks: this one builds two images and starts
+    # twenty-six containers, and Airflow's first start runs a schema
+    # migration before anything else can begin.
+    timeout-minutes: 40
+
+    defaults:
+      run:
+        working-directory: 04-etl
+
+    env:
+      PROFILES: ""
+      SKIP_CLICKHOUSE: "1"
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Show Docker versions and memory
+        # Twenty-six containers on a 16 GiB runner is the tightest fit in this
+        # repository. Printing this makes an out-of-memory kill diagnosable
+        # rather than mysterious.
+        run: |
+          docker compose version
+          free -h
+
+      - name: Prepare .env files for CI
+        run: |
+          cp .env.example .env
+          cp ../03-dbms/.env.example ../03-dbms/.env
+          cp ../02-monitoring/.env.example ../02-monitoring/.env
+          cp ../01-kafka/.env.example ../01-kafka/.env
+          # Lower the JVM limits, leave every image version as pinned. The
+          # container limits stay well above the heaps: a JVM allocates plenty
+          # outside its heap, and a container at 90% of its limit would trip
+          # ContainerNearMemoryLimit and turn a healthy run red.
+          sed -i 's/^KAFKA_HEAP_OPTS=.*/KAFKA_HEAP_OPTS=-Xms256m -Xmx512m/' ../01-kafka/.env
+          sed -i 's/^KAFKA_MEM_LIMIT=.*/KAFKA_MEM_LIMIT=1500m/' ../01-kafka/.env
+          sed -i 's/^CONNECT_HEAP_OPTS=.*/CONNECT_HEAP_OPTS=-Xms256m -Xmx768m/' ../03-dbms/.env
+
+      - name: Validate the compose file and every include
+        run: make config
+
+      - name: Build the job images
+        # DockerOperator never builds anything. Doing this as its own step
+        # means a broken job Dockerfile fails here, with its own log, instead
+        # of surfacing as "No such image" from a task twenty minutes later.
+        run: make jobs
+
+      - name: Start the platform and Airflow
+        run: make up-light
+
+      # Postgres, Debezium and Kafka come from the stack below and are checked
+      # by its own workflow, but the mart job needs data to exist, so capture
+      # is registered here too.
+      - name: Register the Debezium connector
+        run: cd ../03-dbms && make connector
+
+      - name: Wait for Airflow to finish starting
+        # The api-server runs a schema migration on a fresh volume and the
+        # scheduler waits for it. Ninety seconds is comfortably more than that
+        # takes on a runner, and the smoke test polls the API anyway.
+        run: sleep 90
+
+      - name: Smoke test, without the warehouse
+        run: make smoke
+
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== container status ==="
+          docker compose ps -a
+          echo ""
+          echo "=== memory ==="
+          free -h
+          echo ""
+          echo "=== DAG import errors ==="
+          docker compose exec -T airflow-scheduler airflow dags list-import-errors || true
+          echo ""
+          echo "=== DAGs ==="
+          docker compose exec -T airflow-scheduler airflow dags list -o plain || true
+          echo ""
+          echo "=== job images ==="
+          docker images --filter 'reference=dataplatform/job-*' || true
+          echo ""
+          echo "=== scheduler, last 40 lines ==="
+          docker compose logs --no-color --tail=40 airflow-scheduler || true
+          echo ""
+          echo "=== api-server, last 20 lines ==="
+          docker compose logs --no-color --tail=20 airflow-apiserver || true
+
+      - name: Tear down
+        if: always()
+        run: make clean

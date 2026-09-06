@@ -3,6 +3,7 @@
 [![01-kafka](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/01-kafka.yml/badge.svg?branch=main)](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/01-kafka.yml)
 [![02-monitoring](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/02-monitoring.yml/badge.svg?branch=main)](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/02-monitoring.yml)
 [![03-dbms](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/03-dbms.yml/badge.svg?branch=main)](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/03-dbms.yml)
+[![04-etl](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/04-etl.yml/badge.svg?branch=main)](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/04-etl.yml)
 
 A working data platform, assembled with Docker Compose one component at a time.
 
@@ -33,28 +34,27 @@ application, a dbt project, a Python transformation. The container is a unit of
 delivery, not a way to host a service. Airflow starts it, it does its work,
 it exits.
 
-This repository reproduces that boundary rather than blurring it. The numbered
-stacks are the platform: long-lived, stateful, started once and left running.
-Job images are versioned artifacts that know nothing about how the platform was
-brought up, only the addresses and credentials they were handed. That split is
-the point of the whole exercise.
+This repository reproduces that boundary rather than blurring it, and step 4
+makes it concrete: DAGs contain no transformation logic at all. They name an
+image, a schedule and some parameters. The SQL lives inside the image, baked in
+at build time, so the same artifact runs unchanged on ECS.
 
 ### Everything must be portable
 
 Nothing here is allowed to depend on running on a laptop. Object storage speaks
 the S3 protocol, so the same `s3a://` path works locally and in AWS with one
 environment variable changed. Job code receives every endpoint through the
-environment. Nothing is hardcoded that would have to be rewritten to run
-somewhere else.
+environment.
 
 | Component | Local (this repo) | Self-hosted cluster | AWS |
 |---|---|---|---|
 | Broker | Kafka in Compose | Kafka on a Pi cluster | MSK |
 | Change capture | Debezium in Kafka Connect | same | MSK Connect or DMS |
+| Warehouse | ClickHouse cluster | ClickHouse on the Pi cluster | ClickHouse Cloud |
+| Orchestration | Airflow + DockerOperator | same | MWAA + ECS tasks |
+| Jobs | container images | the same images | the same images |
 | Object storage | MinIO | MinIO on local disks | S3 |
 | Processing | Spark standalone | Spark standalone | EMR Serverless |
-| Orchestration | Airflow + DockerOperator | same | MWAA + ECS tasks |
-| Warehouse | ClickHouse cluster | ClickHouse on the Pi cluster | ClickHouse Cloud |
 
 The job code is identical in all three columns. Only the operator in the DAG
 and a handful of environment variables change.
@@ -88,8 +88,8 @@ flowchart LR
 
     API --> K
     OLTP -- CDC --> K
-    K --> SJ
     K --> CH
+    K --> SJ
     SJ --> S3
     S3 --> PY
     PY --> CH
@@ -114,19 +114,21 @@ touches the data itself.
 | 01 | [Kafka](01-kafka/) | 4-node KRaft cluster, 3-controller quorum, Kafbat UI, JMX metrics | done |
 | 02 | [Monitoring](02-monitoring/) | Prometheus with Docker service discovery, Grafana, JMX / lag / host / container exporters, provisioned dashboard | done |
 | 03 | [DBMS](03-dbms/) | Postgres, Debezium change capture, ClickHouse cluster of 4 shards x 2 replicas with Keeper, deduplicating staging layer | done |
-| 04 | ETL | Airflow, DAGs that launch containers rather than run code in-process | next |
-| 05 | Spark | standalone master and workers, resource limits, a job image | planned |
-| 06 | dbt | staging and mart models on ClickHouse, tests, documentation | planned |
-| 07 | MinIO | S3-compatible storage, bucket layout, lifecycle, presigned URLs | planned |
+| 04 | [ETL](04-etl/) | Airflow 3, DAGs that start job containers, a daily mart computed from the staging tables | done |
+| 05 | MinIO | S3-compatible storage, bucket layout, lifecycle, presigned URLs | next |
+| 06 | Spark | standalone master and workers, jobs reading Kafka and S3, writing Parquet | planned |
+| 07 | dbt | models over everything accumulated: CDC staging and Spark output | planned |
 | 08 | Superset | dashboards on top of the marts | planned |
 
-Steps are ordered so that each one can be verified on its own. Monitoring comes
-second on purpose: from that point on, every stack added later arrives with
-metrics rather than getting them bolted on at the end.
+Ordered so that each step gets its input from the previous one. Monitoring is
+second on purpose: from that point on, every stack arrives with metrics rather
+than getting them bolted on. Storage comes before the thing that writes to it,
+and dbt comes after Spark so its models are built over the full picture rather
+than being rewritten when a second source appears.
 
-Candidates for what comes after step 08, not yet committed: an open table
-format for the object storage layer, integration tests with Testcontainers, and
-a Terraform deployment of the same architecture to AWS.
+Candidates for after step 08, not yet committed: an open table format for the
+object storage layer, integration tests with Testcontainers, and a Terraform
+deployment of the same architecture to AWS.
 
 ---
 
@@ -137,51 +139,48 @@ and reason about once they do.
 
 **Distributed systems behaviour.** Kill a Kafka broker and watch partition
 leadership move and the ISR shrink. Kill a ClickHouse replica and watch writes
-keep succeeding on the survivor, then watch the returning node catch up. Work
-out why a quorum of four controllers buys nothing over three, and why three
-Keepers are right for eight ClickHouse nodes. Each stack README ends with a
-failure drill of this kind.
+keep succeeding on the survivor, then watch the returning node catch up. Stop
+the Airflow scheduler and watch the UI carry on looking perfectly healthy while
+nothing gets scheduled. Each stack README ends with drills of this kind.
 
 **Failures that leave everything green.** An exporter whose endpoint answers
 while exporting nothing usable. A Kafka consumer subscribed to a topic it will
 never read. A `CREATE ... ON CLUSTER` that succeeds while every distributed
-query fails, because the two use different transports. Change capture that
-stops, leaving the warehouse serving stale data and reporting no problem at all.
-These are the ones the smoke tests exist for.
+query fails, because the two use different transports. A distributed JOIN that
+returns a plausible, wrong number because the join key is not the sharding key.
+A DAG that fails to import and is therefore absent rather than broken. These
+are what the smoke tests exist for.
 
 **Correctness under change.** Deduplicating a stream of inserts, updates and
-deletes so that readers see one current row. Why the version column must be a
-log position and not a timestamp. Why the sharding key must be the source
-primary key, and why partitioning by a mutable column silently breaks
-deduplication forever.
+deletes so readers see one current row. Why the version column must be a log
+position and not a timestamp. Why partitioning by a mutable column silently
+breaks deduplication forever. Why an idempotent job is worth more than a
+careful operator.
 
 **Operational habits.** Pinned image versions, health checks that mean
 something, resource limits, credentials outside version control, one-command
 teardown and rebuild from scratch.
 
-**Cloud migration mechanics.** Every design note states what the component maps
-to in AWS and what would change.
-
 ---
 
 ## Getting started
 
-Each stack runs independently, and the later ones pull in what they need
-through Compose `include`. Starting step 3 starts all three.
+Each stack runs independently and pulls in what it needs through Compose
+`include`. Starting step 4 starts all four.
 
 ```bash
-cd 03-dbms
+cd 04-etl
 cp .env.example .env
+cp ../03-dbms/.env.example ../03-dbms/.env
 cp ../02-monitoring/.env.example ../02-monitoring/.env
 cp ../01-kafka/.env.example ../01-kafka/.env
 make up
-make connector
+cd ../03-dbms && make connector && cd ../04-etl
 make test
 ```
 
 To start only the broker and its monitoring, do the same from `02-monitoring`.
-To run step 3 without the ClickHouse cluster on a smaller machine, use
-`make up-light`.
+To run without the ClickHouse cluster on a smaller machine, `make up-light`.
 
 Memory is the binding constraint. The full platform wants roughly 24 GiB
 available to Docker; 48 is comfortable. Each stack README states its own needs.
@@ -200,19 +199,18 @@ bigdata-cluster-docker/
     ├── docker-compose.yml the stack itself, commented line by line
     ├── .env.example       configuration template, copy to .env
     ├── Makefile           up / down / logs / test / stack-specific helpers
-    └── scripts/smoke.sh   assertions about the running stack
+    ├── scripts/smoke.sh   assertions about the running stack
+    ├── dags/              scheduling only, no logic          (04-etl)
+    └── jobs/              the work, as versioned images      (04-etl)
 ```
 
 ---
 
 ## Conventions
 
-These hold everywhere, so adding a stack never means learning new rules.
-
 **One shared network.** The first stack you start creates a bridge network
-called `dataplatform`; later stacks join it, either by `include` or as an
-external network. Containers reach each other by service name, never by IP
-address.
+called `dataplatform`; later stacks join it. Containers reach each other by
+service name, never by IP address.
 
 **Nothing runs as `latest`.** Every image tag is pinned in `.env.example`, and
 pinned from the registry rather than from the project's source releases — the
@@ -231,17 +229,17 @@ produces.
 
 **A `Makefile` per stack.** Standard targets everywhere: `up`, `down`, `clean`,
 `ps`, `logs`, `config`, `smoke`, `test`. Run `make` on its own for the full
-list, including helpers specific to that stack.
+list.
 
 **Every stack is verified.** `make config` validates the compose file and every
 configuration it depends on; `make smoke` asserts properties of the running
 stack that a successful start does not prove. GitHub Actions runs both on every
 change, on a clean runner, from an empty state.
 
-Where CI cannot cover something, the stack README says so explicitly and gives
-the commands that do. Step 3 is the current example: eight ClickHouse nodes do
-not fit on a GitHub runner, so its workflow starts everything else and the
-skipped assertions print as `SKIP` rather than quietly disappearing.
+Where CI cannot cover something, the stack README says so and gives the
+commands that do. Steps 3 and 4 are the current examples: eight ClickHouse
+nodes do not fit on a GitHub runner, so those workflows start everything else
+and the skipped assertions print as `SKIP` rather than quietly disappearing.
 
 ---
 
