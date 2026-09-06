@@ -118,6 +118,23 @@ jobs:
           echo "=== job images ==="
           docker images --filter 'reference=dataplatform/job-*' || true
           echo ""
+          echo "=== is the statsd exporter running ==="
+          docker compose ps airflow-statsd || true
+          echo ""
+          echo "=== its labels ==="
+          docker inspect airflow-statsd --format '{{json .Config.Labels}}' 2>/dev/null | tr ',' '\n' | grep prometheus || echo "container not found"
+          echo ""
+          echo "=== its network ==="
+          docker inspect airflow-statsd --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null || true
+          echo ""
+          echo "=== does its endpoint answer ==="
+          docker compose exec -T airflow-statsd wget -qO- http://localhost:9102/metrics 2>/dev/null | head -5 || echo "no answer"
+          echo ""
+          echo "=== what docker-sd discovered ==="
+          curl -s 'http://localhost:9090/api/v1/targets?state=any' | grep -o '"__meta_docker_container_name":"/[^"]*"' | sort -u || true
+          echo ""
+          echo "=== active jobs ==="
+          curl -s 'http://localhost:9090/api/v1/targets?state=active' | grep -o '"job":"[^"]*"' | sort | uniq -c || true
           echo "=== scheduler, last 40 lines ==="
           docker compose logs --no-color --tail=40 airflow-scheduler || true
           echo ""
