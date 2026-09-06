@@ -1,26 +1,26 @@
 # ============================================================================
-#  A job image that does nothing useful, on purpose
+#  Airflow with the Docker provider
 # ============================================================================
-#  This exists to debug the mechanics of running a job container from Airflow
-#  separately from any real logic: reaching the Docker socket, joining the
-#  right network, passing parameters, and where the output ends up.
+#  The base image does not include apache-airflow-providers-docker, and
+#  DockerOperator is the whole point of this stack: DAGs here start job
+#  containers, they do not run job code in-process.
 #
-#  Debugging those four things at the same time as a SQL transformation is how
-#  you spend an afternoon deciding whether the query is wrong or the container
-#  never received its arguments.
-#
-#  Note what this image is NOT: it is not built by docker-compose as a service.
-#  Nothing starts it and leaves it running. It is an artifact that Airflow
-#  runs and that then exits — the boundary this whole repository is built
-#  around. `make jobs` builds it.
+#  Installed with the constraint file for this exact Airflow version.
+#  Installing a provider without constraints is how you silently upgrade a
+#  transitive dependency of Airflow itself and get an import error on a class
+#  that has nothing to do with what you installed.
 # ============================================================================
-FROM python:3.12-slim
+ARG AIRFLOW_VERSION
+FROM apache/airflow:${AIRFLOW_VERSION}
 
-WORKDIR /app
-COPY run.py /app/run.py
+# Repeated after FROM on purpose: an ARG declared before the first FROM is
+# only visible to that line, not to the build stage that follows it. This is
+# the single most common reason a build argument silently becomes empty.
+ARG AIRFLOW_VERSION
+ARG PYTHON_VERSION=3.12
 
-# Unbuffered, or the output arrives after the container has already exited and
-# Airflow captures nothing.
-ENV PYTHONUNBUFFERED=1
+USER airflow
 
-ENTRYPOINT ["python", "/app/run.py"]
+RUN pip install --no-cache-dir \
+      "apache-airflow-providers-docker" \
+      --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt"

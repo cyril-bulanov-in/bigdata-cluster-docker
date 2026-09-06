@@ -38,10 +38,15 @@ name: platform
 #  only in the command they run.
 # ----------------------------------------------------------------------------
 x-airflow: &airflow
-  build:
-    context: ./airflow
-    args:
-      AIRFLOW_VERSION: ${AIRFLOW_VERSION}
+  # Only the image, no build section.
+  #
+  # Four services share this anchor, so a build section here declares the same
+  # image four times. Compose's bake backend merges those targets and the
+  # build contexts can end up crossed — the symptom was airflow-scheduler
+  # failing on `COPY run.py`, a line that exists only in jobs/hello/Dockerfile.
+  #
+  # airflow-init below owns the build; every other component waits for it to
+  # finish and finds the image already there.
   image: dataplatform/airflow:${AIRFLOW_VERSION}
   restart: unless-stopped
   networks: [dataplatform]
@@ -144,6 +149,12 @@ services:
     <<: *airflow
     container_name: airflow-init
     restart: "no"
+    # The one place the image is built. Everything else depends on this
+    # service completing, so by the time they start the image exists.
+    build:
+      context: ./airflow
+      args:
+        AIRFLOW_VERSION: ${AIRFLOW_VERSION}
     command: ["db", "migrate"]
 
   # ==========================================================================
