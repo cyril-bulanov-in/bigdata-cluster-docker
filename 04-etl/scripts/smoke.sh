@@ -29,7 +29,7 @@ read_env() {
   grep -E "^$1=" "$2" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' || true
 }
 
-AF_PORT="$(read_env AIRFLOW_PORT .env)";   AF_PORT="${AF_PORT:-8081}"
+AF_PORT="$(read_env AIRFLOW_PORT .env)";    AF_PORT="${AF_PORT:-8081}"
 JOB_VERSION="$(read_env JOB_VERSION .env)"; JOB_VERSION="${JOB_VERSION:-0.1.0}"
 PROM_PORT="$(read_env PROMETHEUS_PORT ../02-monitoring/.env)"; PROM_PORT="${PROM_PORT:-9090}"
 
@@ -39,6 +39,26 @@ PROM="http://localhost:${PROM_PORT}"
 AF_COMPONENTS="airflow-apiserver airflow-scheduler airflow-dag-processor airflow-triggerer"
 EXPECTED_DAGS="00_docker_smoke 10_daily_sales"
 API_TIMEOUT=120
+
+# ---------------------------------------------------------------------------
+#  How long to wait for a metric to exist
+# ---------------------------------------------------------------------------
+#  Two separate delays, and neither is a sign of anything wrong.
+#
+#  Prometheus polls Docker for containers every 30s, so a container that
+#  started in the same wave as Prometheus itself is not discovered on the
+#  first pass.
+#
+#  Airflow pushes StatsD as events happen. An idle scheduler does emit
+#  heartbeats, but not the instant it starts.
+#
+#  Checking once made this test pass on a machine where the stack had been up
+#  for a while and fail on a cold CI runner — the same mistake, in the same
+#  shape, that the metric checks in 02-monitoring already document. Retrying
+#  costs nothing when the answer is already there: the first attempt succeeds.
+# ---------------------------------------------------------------------------
+METRIC_TIMEOUT=120
+METRIC_INTERVAL=10
 
 PASSED=0; FAILED=0; SKIPPED=0
 pass() { printf '  \033[32mPASS\033[0m  %s\n' "$1"; PASSED=$((PASSED + 1)); }
@@ -64,14 +84,15 @@ fi
 info "Airflow components"
 
 for c in $AF_COMPONENTS; do
-  state=$($COMPOSE ps --format '{{.Name}} {{.State}}' 2>/dev/null | awk -v n="$c" '$1 == n {print $2}')
+  state=$($COMPOSE ps --format '{{.Name}} {{.State}}' 2>/dev/null | awk -v n="$c" '$1 == n {print $2}' || true)
   [ "$state" = "running" ] \
     && pass "$c is running" \
     || fail "$c is ${state:-absent}"
 done
 
-# The api-server takes a while. Polling rather than a single check, because a
-# stack that was started thirty seconds ago is not a stack that is broken.
+# The api-server takes a while: on a fresh volume it runs a schema migration
+# before it serves anything. Polling rather than a single check, because a
+# stack started thirty seconds ago is not a stack that is broken.
 api_ok=0
 deadline=$(( $(date +%s) + API_TIMEOUT ))
 while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -92,7 +113,6 @@ info "DAGs"
 # Import errors first. A DAG that fails to import is not listed as broken —
 # it is not listed at all, which is indistinguishable from a file that was
 # never written.
-import_errors=$(af airflow dags list-import-errors -o plain | grep -cv '^No data found' || true)
 errors_text=$(af airflow dags list-import-errors -o plain)
 if printf '%s' "$errors_text" | grep -qi 'no data found'; then
   pass "no DAG import errors"
@@ -125,26 +145,43 @@ done
 # ---------------------------------------------------------------------------
 #  4. Metrics
 # ---------------------------------------------------------------------------
-info "Metrics"
-
-# `|| true` on the whole pipeline, not just the curl.
+#  Both checks retry — see the note at the top on why "the container is up" and
+#  "the metric exists" are not the same moment.
 #
-# With `set -o pipefail`, a failed curl OR a grep that matches nothing returns
-# non-zero, `set -e` sees it on a variable assignment, and the script dies
-# without printing anything at all. The check that was meant to report a
-# missing target instead removes every check after it.
-targets_body=$(curl -fsS --max-time 10 "${PROM}/api/v1/targets?state=active" 2>/dev/null || true)
-targets=$(printf '%s' "$targets_body" | grep -o '"job": *"airflow"' | wc -l | tr -d ' ' || true)
-[ "${targets:-0}" -ge 1 ] \
-  && pass "Prometheus is scraping the Airflow exporter" \
-  || fail "no airflow scrape target — check the labels on airflow-statsd"
+#  Note also the `|| true` on every pipeline. With `set -o pipefail`, a curl
+#  that cannot connect or a grep that matches nothing returns non-zero, `set -e`
+#  sees it on a variable assignment, and the script dies without printing
+#  anything at all — removing every check after it rather than reporting one.
+# ---------------------------------------------------------------------------
+info "Metrics (waiting up to ${METRIC_TIMEOUT}s each)"
 
-series_body=$(curl -fsS --max-time 10 --get --data-urlencode 'query=count({__name__=~"airflow_.*"})' \
-                "${PROM}/api/v1/query" 2>/dev/null || true)
-series=$(printf '%s' "$series_body" | grep -o '"[0-9]*"]' | head -1 | tr -d '"]' || true)
+waited=0
+targets=0
+while :; do
+  targets_body=$(curl -fsS --max-time 10 "${PROM}/api/v1/targets?state=active" 2>/dev/null || true)
+  targets=$(printf '%s' "$targets_body" | grep -o '"job": *"airflow"' | wc -l | tr -d ' ' || true)
+  [ "${targets:-0}" -ge 1 ] && break
+  [ "$waited" -ge "$METRIC_TIMEOUT" ] && break
+  sleep "$METRIC_INTERVAL"; waited=$((waited + METRIC_INTERVAL))
+done
+[ "${targets:-0}" -ge 1 ] \
+  && pass "Prometheus is scraping the Airflow exporter (after ${waited}s)" \
+  || fail "no airflow scrape target after ${METRIC_TIMEOUT}s — check the labels on airflow-statsd"
+
+waited=0
+series=0
+while :; do
+  series_body=$(curl -fsS --max-time 10 --get \
+                  --data-urlencode 'query=count({__name__=~"airflow_.*"})' \
+                  "${PROM}/api/v1/query" 2>/dev/null || true)
+  series=$(printf '%s' "$series_body" | grep -o '"[0-9]*"\]' | head -1 | tr -d '"]' || true)
+  [ "${series:-0}" -gt 0 ] 2>/dev/null && break
+  [ "$waited" -ge "$METRIC_TIMEOUT" ] && break
+  sleep "$METRIC_INTERVAL"; waited=$((waited + METRIC_INTERVAL))
+done
 [ "${series:-0}" -gt 0 ] 2>/dev/null \
-  && pass "${series} airflow metric series present" \
-  || fail "no airflow metrics — Airflow pushes StatsD, so an idle scheduler still emits heartbeats"
+  && pass "${series} airflow metric series present (after ${waited}s)" \
+  || fail "no airflow metrics after ${METRIC_TIMEOUT}s — Airflow pushes StatsD, so even an idle scheduler should emit heartbeats"
 
 # ---------------------------------------------------------------------------
 #  5. A job that actually does something
