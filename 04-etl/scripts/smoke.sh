@@ -127,14 +127,21 @@ done
 # ---------------------------------------------------------------------------
 info "Metrics"
 
-targets=$(curl -fsS "${PROM}/api/v1/targets?state=active" 2>/dev/null \
-          | grep -o '"job": *"airflow"' | wc -l | tr -d ' ')
+# `|| true` on the whole pipeline, not just the curl.
+#
+# With `set -o pipefail`, a failed curl OR a grep that matches nothing returns
+# non-zero, `set -e` sees it on a variable assignment, and the script dies
+# without printing anything at all. The check that was meant to report a
+# missing target instead removes every check after it.
+targets_body=$(curl -fsS --max-time 10 "${PROM}/api/v1/targets?state=active" 2>/dev/null || true)
+targets=$(printf '%s' "$targets_body" | grep -o '"job": *"airflow"' | wc -l | tr -d ' ' || true)
 [ "${targets:-0}" -ge 1 ] \
   && pass "Prometheus is scraping the Airflow exporter" \
   || fail "no airflow scrape target — check the labels on airflow-statsd"
 
-series=$(curl -fsS --get --data-urlencode 'query=count({__name__=~"airflow_.*"})' \
-           "${PROM}/api/v1/query" 2>/dev/null | grep -o '"[0-9]*"]' | head -1 | tr -d '"]')
+series_body=$(curl -fsS --max-time 10 --get --data-urlencode 'query=count({__name__=~"airflow_.*"})' \
+                "${PROM}/api/v1/query" 2>/dev/null || true)
+series=$(printf '%s' "$series_body" | grep -o '"[0-9]*"]' | head -1 | tr -d '"]' || true)
 [ "${series:-0}" -gt 0 ] 2>/dev/null \
   && pass "${series} airflow metric series present" \
   || fail "no airflow metrics — Airflow pushes StatsD, so an idle scheduler still emits heartbeats"
