@@ -59,7 +59,7 @@ jobs:
         run: |
           cp .env.example .env
           cp ../01-kafka/.env.example ../01-kafka/.env
-          sed -i "s/^DOCKER_GID=.*/DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)/" 02-monitoring/.env
+          sed -i "s/^DOCKER_GID=.*/DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)/" .env
           # The runner has less memory than a workstation. Only the Kafka
           # limits are lowered; every image version stays exactly as pinned,
           # so CI tests the same versions you run locally.
