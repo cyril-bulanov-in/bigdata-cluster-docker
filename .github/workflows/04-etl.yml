@@ -65,6 +65,7 @@ jobs:
           cp ../03-dbms/.env.example ../03-dbms/.env
           cp ../02-monitoring/.env.example ../02-monitoring/.env
           cp ../01-kafka/.env.example ../01-kafka/.env
+          sed -i "s/^DOCKER_GID=.*/DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)/" ../02-monitoring/.env
           # Lower the JVM limits, leave every image version as pinned. The
           # container limits stay well above the heaps: a JVM allocates plenty
           # outside its heap, and a container at 90% of its limit would trip
