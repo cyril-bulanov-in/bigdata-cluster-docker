@@ -1,0 +1,121 @@
+# Boots the platform without the ClickHouse cluster, builds the Spark image
+# and starts the cluster, then checks that it is usable rather than merely
+# running: workers offering cores, the S3 jars on a worker, hadoop-aws
+# matching the Hadoop compiled into Spark, and Prometheus scraping both roles.
+#
+# Run early and on its own, before any job is written on top. The most likely
+# failure here is the image build — it fetches two jars from Maven Central,
+# and a runner's network is not this laptop's.
+
+name: 06-spark
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '06-spark/**'
+      - '05-minio/**'
+      - '04-etl/**'
+      - '03-dbms/**'
+      - '02-monitoring/**'
+      - '01-kafka/**'
+      - '.github/workflows/06-spark.yml'
+  pull_request:
+    paths:
+      - '06-spark/**'
+      - '05-minio/**'
+      - '04-etl/**'
+      - '03-dbms/**'
+      - '02-monitoring/**'
+      - '01-kafka/**'
+      - '.github/workflows/06-spark.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: 06-spark-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    defaults:
+      run:
+        working-directory: 06-spark
+
+    env:
+      PROFILES: ""
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Show Docker versions and memory
+        run: |
+          docker compose version
+          free -h
+
+      - name: Prepare .env files for CI
+        run: |
+          cp .env.example .env
+          cp ../05-minio/.env.example ../05-minio/.env
+          cp ../04-etl/.env.example ../04-etl/.env
+          cp ../03-dbms/.env.example ../03-dbms/.env
+          cp ../02-monitoring/.env.example ../02-monitoring/.env
+          cp ../01-kafka/.env.example ../01-kafka/.env
+          # The gid owning the Docker socket. A fixed value does not travel:
+          # 0 on Docker Desktop, the `docker` group on a runner. Getting it
+          # wrong makes docker_sd discover nothing at all, silently.
+          sed -i "s/^DOCKER_GID=.*/DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)/" ../02-monitoring/.env
+          sed -i 's/^KAFKA_HEAP_OPTS=.*/KAFKA_HEAP_OPTS=-Xms256m -Xmx512m/' ../01-kafka/.env
+          sed -i 's/^KAFKA_MEM_LIMIT=.*/KAFKA_MEM_LIMIT=1500m/' ../01-kafka/.env
+          sed -i 's/^CONNECT_HEAP_OPTS=.*/CONNECT_HEAP_OPTS=-Xms256m -Xmx768m/' ../03-dbms/.env
+          # Four workers at 1 GiB is 4 GiB on top of everything else. Half
+          # that is still four separate executors, which is what the checks
+          # are about.
+          sed -i 's/^SPARK_WORKER_MEMORY=.*/SPARK_WORKER_MEMORY=512m/' .env
+
+      - name: Validate the compose file and every include
+        run: make config
+
+      # Its own step, because this is where it is most likely to fail: two
+      # jars from Maven Central, and the build verifies their contents rather
+      # than trusting that a download succeeded. A failure here is about the
+      # image, not about the cluster.
+      - name: Build the Spark image
+        run: docker compose build spark-master
+
+      - name: Start the platform and the Spark cluster
+        run: make up-light
+
+      - name: Smoke test
+        run: make smoke
+
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== container status ==="
+          docker compose ps -a
+          echo ""
+          echo "=== memory ==="
+          free -h
+          echo ""
+          echo "=== the master's view ==="
+          curl -s http://localhost:8090/json/ || true
+          echo ""
+          echo "=== jars on a worker ==="
+          docker compose exec -T spark-worker-1 ls /opt/spark/jars | grep -E 'hadoop|aws' || true
+          echo ""
+          echo "=== master, last 40 lines ==="
+          docker compose logs --no-color --tail=40 spark-master || true
+          echo ""
+          echo "=== worker 1, last 30 lines ==="
+          docker compose logs --no-color --tail=30 spark-worker-1 || true
+          echo ""
+          echo "=== what prometheus discovered ==="
+          curl -s 'http://localhost:9090/api/v1/targets?state=active' \
+            | grep -o '"job":"[^"]*"' | sort | uniq -c || true
+
+      - name: Tear down
+        if: always()
+        run: make clean

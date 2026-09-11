@@ -1,0 +1,184 @@
+# ============================================================================
+#  PLATFORM — step 6: Spark (part 1 — the cluster)
+# ============================================================================
+#
+#  A standalone Spark cluster: one master, four workers. No jobs yet.
+#
+#  Start:  make up
+#  UI:     http://localhost:8090
+#
+# ----------------------------------------------------------------------------
+#  Standalone rather than YARN or Kubernetes
+# ----------------------------------------------------------------------------
+#  YARN would mean running Hadoop to schedule Spark, which is a resource
+#  manager this platform has no other use for. Kubernetes would mean running
+#  Kubernetes. Standalone is Spark's own scheduler: a master that hands out
+#  executors and workers that run them.
+#
+#  It maps onto EMR Serverless the same way the rest does — a job submits, an
+#  executor set is allocated, the job ends. What changes in AWS is who
+#  allocates, not what the job says.
+# ----------------------------------------------------------------------------
+include:
+  - ../05-minio/docker-compose.yml
+
+name: platform
+
+# ----------------------------------------------------------------------------
+#  Shared settings for every Spark node
+# ----------------------------------------------------------------------------
+#  Master, workers and jobs all run the same image — the one built in
+#  ./spark, with the S3 jars added. Workers execute the tasks that read S3, so
+#  the jars have to be on every node; an image that only the submitter uses
+#  produces a job that plans correctly and fails on the first executor.
+# ----------------------------------------------------------------------------
+x-spark: &spark
+  build:
+    context: ./spark
+    args:
+      SPARK_IMAGE: ${SPARK_IMAGE}
+      HADOOP_AWS_VERSION: ${HADOOP_AWS_VERSION}
+      AWS_SDK_VERSION: ${AWS_SDK_VERSION}
+  image: dataplatform/spark:${SPARK_VERSION}
+  restart: unless-stopped
+  networks: [dataplatform]
+  environment:
+    # Credentials for S3A, read by SimpleAWSCredentialsProvider. The same two
+    # variables an AWS deployment would leave unset, letting an instance role
+    # supply them instead.
+    AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+    AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+    # The endpoint. This is the one line that changes when the same image runs
+    # against real S3.
+    SPARK_HADOOP_FS_S3A_ENDPOINT: ${S3_ENDPOINT}
+  volumes:
+    # Event logs, so a finished application can still be opened in the UI.
+    # Shared between all nodes because the history is written by whichever
+    # driver ran the job.
+    - spark-events:/opt/spark/events
+
+services:
+
+  # ==========================================================================
+  #  The master
+  # ==========================================================================
+  #  Hands out executors and keeps track of workers. Holds no data and does no
+  #  work: killing it stops new jobs from starting and does not stop the ones
+  #  already running.
+  # ==========================================================================
+  spark-master:
+    <<: *spark
+    container_name: spark-master
+    hostname: spark-master
+    command: >
+      /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+      --host spark-master --port 7077 --webui-port 8080
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      SPARK_HADOOP_FS_S3A_ENDPOINT: ${S3_ENDPOINT}
+      # Without this the master advertises its container id as its hostname,
+      # and workers registering against it end up with a URL nobody else can
+      # resolve.
+      SPARK_MASTER_HOST: spark-master
+    ports:
+      # 8080 on the host is Kafbat UI, so the Spark UI goes to 8090.
+      - "${SPARK_MASTER_UI_PORT}:8080"
+      # The submit port. Published so a job can be submitted from the host
+      # while developing, not just from inside the network.
+      - "${SPARK_MASTER_PORT}:7077"
+    labels:
+      prometheus.scrape: "true"
+      prometheus.port: "8080"
+      prometheus.job: "spark-master"
+      # Each Spark role serves metrics on its own path — see metrics.properties.
+      prometheus.path: "/metrics/master/prometheus"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080 >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 8
+      start_period: 20s
+
+  # ==========================================================================
+  #  Four workers
+  # ==========================================================================
+  #  Each registers with the master and offers its cores and memory. Four
+  #  rather than two so that a job visibly spreads across executors instead of
+  #  merely running — the difference between "it works" and being able to see
+  #  how partitions are distributed.
+  #
+  #  One core each on purpose: the point is to watch parallelism, and four
+  #  single-core workers make the split legible in a way two four-core workers
+  #  do not.
+  # ==========================================================================
+  spark-worker-1:
+    <<: *spark
+    container_name: spark-worker-1
+    hostname: spark-worker-1
+    command: >
+      /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker
+      spark://spark-master:7077 --webui-port 8081
+      --cores ${SPARK_WORKER_CORES} --memory ${SPARK_WORKER_MEMORY}
+    labels:
+      prometheus.scrape: "true"
+      prometheus.port: "8081"
+      prometheus.job: "spark-worker"
+      prometheus.path: "/metrics/prometheus"
+    depends_on:
+      spark-master:
+        condition: service_healthy
+
+  spark-worker-2:
+    <<: *spark
+    container_name: spark-worker-2
+    hostname: spark-worker-2
+    command: >
+      /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker
+      spark://spark-master:7077 --webui-port 8081
+      --cores ${SPARK_WORKER_CORES} --memory ${SPARK_WORKER_MEMORY}
+    labels:
+      prometheus.scrape: "true"
+      prometheus.port: "8081"
+      prometheus.job: "spark-worker"
+      prometheus.path: "/metrics/prometheus"
+    depends_on:
+      spark-master:
+        condition: service_healthy
+
+  spark-worker-3:
+    <<: *spark
+    container_name: spark-worker-3
+    hostname: spark-worker-3
+    command: >
+      /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker
+      spark://spark-master:7077 --webui-port 8081
+      --cores ${SPARK_WORKER_CORES} --memory ${SPARK_WORKER_MEMORY}
+    labels:
+      prometheus.scrape: "true"
+      prometheus.port: "8081"
+      prometheus.job: "spark-worker"
+      prometheus.path: "/metrics/prometheus"
+    depends_on:
+      spark-master:
+        condition: service_healthy
+
+  spark-worker-4:
+    <<: *spark
+    container_name: spark-worker-4
+    hostname: spark-worker-4
+    command: >
+      /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker
+      spark://spark-master:7077 --webui-port 8081
+      --cores ${SPARK_WORKER_CORES} --memory ${SPARK_WORKER_MEMORY}
+    labels:
+      prometheus.scrape: "true"
+      prometheus.port: "8081"
+      prometheus.job: "spark-worker"
+      prometheus.path: "/metrics/prometheus"
+    depends_on:
+      spark-master:
+        condition: service_healthy
+
+volumes:
+  spark-events:
