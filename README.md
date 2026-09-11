@@ -4,6 +4,7 @@
 [![02-monitoring](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/02-monitoring.yml/badge.svg?branch=main)](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/02-monitoring.yml)
 [![03-dbms](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/03-dbms.yml/badge.svg?branch=main)](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/03-dbms.yml)
 [![04-etl](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/04-etl.yml/badge.svg?branch=main)](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/04-etl.yml)
+[![05-minio](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/05-minio.yml/badge.svg?branch=main)](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/05-minio.yml)
 
 A working data platform, assembled with Docker Compose one component at a time.
 
@@ -34,10 +35,9 @@ application, a dbt project, a Python transformation. The container is a unit of
 delivery, not a way to host a service. Airflow starts it, it does its work,
 it exits.
 
-This repository reproduces that boundary rather than blurring it, and step 4
-makes it concrete: DAGs contain no transformation logic at all. They name an
-image, a schedule and some parameters. The SQL lives inside the image, baked in
-at build time, so the same artifact runs unchanged on ECS.
+Step 4 makes that concrete: the DAGs contain no transformation logic at all.
+They name an image, a schedule and some parameters. The SQL lives inside the
+image, baked in at build time, so the same artifact runs unchanged on ECS.
 
 ### Everything must be portable
 
@@ -52,8 +52,8 @@ environment.
 | Change capture | Debezium in Kafka Connect | same | MSK Connect or DMS |
 | Warehouse | ClickHouse cluster | ClickHouse on the Pi cluster | ClickHouse Cloud |
 | Orchestration | Airflow + DockerOperator | same | MWAA + ECS tasks |
-| Jobs | container images | the same images | the same images |
 | Object storage | MinIO | MinIO on local disks | S3 |
+| Jobs | container images | the same images | the same images |
 | Processing | Spark standalone | Spark standalone | EMR Serverless |
 
 The job code is identical in all three columns. Only the operator in the DAG
@@ -90,6 +90,7 @@ flowchart LR
     OLTP -- CDC --> K
     K --> CH
     K --> SJ
+    CH --> S3
     SJ --> S3
     S3 --> PY
     PY --> CH
@@ -114,9 +115,9 @@ touches the data itself.
 | 01 | [Kafka](01-kafka/) | 4-node KRaft cluster, 3-controller quorum, Kafbat UI, JMX metrics | done |
 | 02 | [Monitoring](02-monitoring/) | Prometheus with Docker service discovery, Grafana, JMX / lag / host / container exporters, provisioned dashboard | done |
 | 03 | [DBMS](03-dbms/) | Postgres, Debezium change capture, ClickHouse cluster of 4 shards x 2 replicas with Keeper, deduplicating staging layer | done |
-| 04 | [ETL](04-etl/) | Airflow 3, DAGs that start job containers, a daily mart computed from the staging tables | done |
-| 05 | MinIO | S3-compatible storage, bucket layout, lifecycle, presigned URLs | next |
-| 06 | Spark | standalone master and workers, jobs reading Kafka and S3, writing Parquet | planned |
+| 04 | [ETL](04-etl/) | Airflow 3, DAGs that start job containers, a daily mart, a Parquet export to S3 | done |
+| 05 | [MinIO](05-minio/) | S3-compatible storage, three-layer bucket layout, versioning, lifecycle rules | done |
+| 06 | Spark | standalone master and workers, jobs reading Kafka and S3, writing Parquet | next |
 | 07 | dbt | models over everything accumulated: CDC staging and Spark output | planned |
 | 08 | Superset | dashboards on top of the marts | planned |
 
@@ -148,8 +149,10 @@ while exporting nothing usable. A Kafka consumer subscribed to a topic it will
 never read. A `CREATE ... ON CLUSTER` that succeeds while every distributed
 query fails, because the two use different transports. A distributed JOIN that
 returns a plausible, wrong number because the join key is not the sharding key.
-A DAG that fails to import and is therefore absent rather than broken. These
-are what the smoke tests exist for.
+A DAG that fails to import and is therefore absent rather than broken. A
+versioned bucket quietly keeping every overwrite for ever. An alerting rule
+naming a metric that does not exist, which never fires and never complains.
+These are what the smoke tests exist for.
 
 **Correctness under change.** Deduplicating a stream of inserts, updates and
 deletes so readers see one current row. Why the version column must be a log
@@ -166,16 +169,16 @@ teardown and rebuild from scratch.
 ## Getting started
 
 Each stack runs independently and pulls in what it needs through Compose
-`include`. Starting step 4 starts all four.
+`include`. Starting step 5 starts all five.
 
 ```bash
-cd 04-etl
+cd 05-minio
 cp .env.example .env
+cp ../04-etl/.env.example ../04-etl/.env
 cp ../03-dbms/.env.example ../03-dbms/.env
 cp ../02-monitoring/.env.example ../02-monitoring/.env
 cp ../01-kafka/.env.example ../01-kafka/.env
 make up
-cd ../03-dbms && make connector && cd ../04-etl
 make test
 ```
 
@@ -213,13 +216,21 @@ called `dataplatform`; later stacks join it. Containers reach each other by
 service name, never by IP address.
 
 **Nothing runs as `latest`.** Every image tag is pinned in `.env.example`, and
-pinned from the registry rather than from the project's source releases — the
-two are not always in step. Where a project publishes no maintained image, the
-Dockerfile takes the artifact from its GitHub release and verifies it.
+pinned from the **registry** rather than from the project's source releases —
+the two are not always in step, and MinIO is the current example: its public
+images stop months behind its releases. Where a project publishes no maintained
+image, the Dockerfile takes the artifact from its GitHub release and verifies
+it.
 
 **Configuration through `.env`.** Secrets and machine-specific values stay out
 of the repository. Each stack ships a documented `.env.example`, and `make up`
 refuses to start if the real file is missing.
+
+**Exporters register themselves.** Since step 2 Prometheus discovers targets
+through the Docker API: an exporter carries `prometheus.scrape`,
+`prometheus.port` and optionally `prometheus.job` and `prometheus.path` as
+container labels, and no stack has to edit the monitoring configuration to be
+seen.
 
 **Comments explain the why.** Compose files are written for someone who knows
 what a container is but has not memorised Kafka listener semantics or
@@ -237,9 +248,9 @@ stack that a successful start does not prove. GitHub Actions runs both on every
 change, on a clean runner, from an empty state.
 
 Where CI cannot cover something, the stack README says so and gives the
-commands that do. Steps 3 and 4 are the current examples: eight ClickHouse
-nodes do not fit on a GitHub runner, so those workflows start everything else
-and the skipped assertions print as `SKIP` rather than quietly disappearing.
+commands that do. Steps 3 to 5 are the current examples: eight ClickHouse nodes
+do not fit on a GitHub runner, so those workflows start everything else and the
+skipped assertions print as `SKIP` rather than quietly disappearing.
 
 ---
 
