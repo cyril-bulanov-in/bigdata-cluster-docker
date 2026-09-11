@@ -1,0 +1,126 @@
+# Boots the platform without the ClickHouse cluster, starts MinIO, and checks
+# that object storage works: buckets, versioning, lifecycle, metrics, and a
+# write that is read back and compared.
+#
+# The export job needs ClickHouse and is therefore covered locally only — see
+# "What continuous integration does not cover" in 05-minio/README.md.
+
+name: 05-minio
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '05-minio/**'
+      - '04-etl/**'
+      - '03-dbms/**'
+      - '02-monitoring/**'
+      - '01-kafka/**'
+      - '.github/workflows/05-minio.yml'
+  pull_request:
+    paths:
+      - '05-minio/**'
+      - '04-etl/**'
+      - '03-dbms/**'
+      - '02-monitoring/**'
+      - '01-kafka/**'
+      - '.github/workflows/05-minio.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: 05-minio-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    # The deepest include chain in the repository: five stacks, two image
+    # builds, and Airflow's first start runs a schema migration.
+    timeout-minutes: 40
+
+    defaults:
+      run:
+        working-directory: 05-minio
+
+    env:
+      PROFILES: ""
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Show Docker versions and memory
+        # Without the warehouse this is still around twenty containers. The
+        # figure makes an out-of-memory kill diagnosable rather than
+        # mysterious.
+        run: |
+          docker compose version
+          free -h
+
+      - name: Prepare .env files for CI
+        run: |
+          cp .env.example .env
+          cp ../04-etl/.env.example ../04-etl/.env
+          cp ../03-dbms/.env.example ../03-dbms/.env
+          cp ../02-monitoring/.env.example ../02-monitoring/.env
+          cp ../01-kafka/.env.example ../01-kafka/.env
+          # The gid that owns the Docker socket. A fixed value does not
+          # travel: on Docker Desktop it is 0, on a runner it is the `docker`
+          # group. Getting it wrong makes docker_sd discover nothing at all,
+          # silently — the static jobs keep working and monitoring looks fine
+          # while every label-based target is missing.
+          sed -i "s/^DOCKER_GID=.*/DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)/" ../02-monitoring/.env
+          # Lower the JVM limits, leave every image version as pinned.
+          sed -i 's/^KAFKA_HEAP_OPTS=.*/KAFKA_HEAP_OPTS=-Xms256m -Xmx512m/' ../01-kafka/.env
+          sed -i 's/^KAFKA_MEM_LIMIT=.*/KAFKA_MEM_LIMIT=1500m/' ../01-kafka/.env
+          sed -i 's/^CONNECT_HEAP_OPTS=.*/CONNECT_HEAP_OPTS=-Xms256m -Xmx768m/' ../03-dbms/.env
+
+      - name: Validate the compose file and every include
+        run: make config
+
+      - name: Start the platform and MinIO
+        run: make up-light
+
+      - name: Wait for the bucket layout
+        # minio-init runs to completion and exits; the smoke test asserts on
+        # what it created, so there is no point starting before it has.
+        run: |
+          for i in $(seq 1 30); do
+            if [ "$(docker inspect -f '{{.State.Status}}' minio-init 2>/dev/null)" = "exited" ]; then
+              echo "minio-init finished after ${i} attempts"
+              docker logs minio-init
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "minio-init did not finish"
+          docker logs minio-init || true
+          exit 1
+
+      - name: Smoke test
+        run: make smoke
+
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== container status ==="
+          docker compose ps -a
+          echo ""
+          echo "=== memory ==="
+          free -h
+          echo ""
+          echo "=== minio-init ==="
+          docker logs minio-init 2>&1 | tail -30 || true
+          echo ""
+          echo "=== minio, last 30 lines ==="
+          docker compose logs --no-color --tail=30 minio || true
+          echo ""
+          echo "=== buckets ==="
+          make buckets || true
+          echo ""
+          echo "=== what prometheus discovered ==="
+          curl -s 'http://localhost:9090/api/v1/targets?state=active' \
+            | grep -o '"job":"[^"]*"' | sort | uniq -c || true
+
+      - name: Tear down
+        if: always()
+        run: make clean

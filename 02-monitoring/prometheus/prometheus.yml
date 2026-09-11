@@ -6,18 +6,15 @@
 #    static_configs   for the containers this stack owns and always starts
 #    docker_sd        for everything else, discovered by container label
 #
-#  The second one is why later stacks need no change to this file. See the
-#  docker-sd job at the bottom.
+#  The second one is why later stacks need no change to this file.
 #
-#  After editing this file:  make reload   (no restart, no data loss)
+#  After editing:  make reload   (no restart, no data loss)
 # ============================================================================
 
 global:
-  # How often each target is scraped. 15s is fine enough to see a spike and
-  # cheap enough that a laptop does not notice.
   scrape_interval: 15s
-  # How often every alerting rule is re-evaluated. Keeping it equal to the
-  # scrape interval means a rule never runs twice on the same data point.
+  # Equal to the scrape interval, so a rule never runs twice on the same data
+  # point.
   evaluation_interval: 15s
 
   # Attached to every metric this server collects. Matters as soon as there is
@@ -29,15 +26,15 @@ global:
 #  Alerting rules
 # ----------------------------------------------------------------------------
 #  A glob, so a new file dropped into the directory is picked up by
-#  `make reload` without touching this config. Later stacks add their rules
-#  as their own file here — for example rules/03-dbms.yml.
+#  `make reload`. Later stacks add their rules as their own file here —
+#  rules/03-dbms.yml, rules/04-etl.yml, rules/05-minio.yml.
 #
 #  Rules for a stack that is not running are harmless: their expressions
-#  reference metrics that do not exist, so they simply never match.
+#  reference metrics that do not exist, so they never match.
 #
-#  There is no `alerting:` section pointing at an Alertmanager yet. Prometheus
+#  There is no `alerting:` section pointing at an Alertmanager. Prometheus
 #  evaluates the rules and shows what is firing in its own UI; it simply has
-#  nowhere to send them. That is a deliberate gap, not an oversight.
+#  nowhere to send them. A deliberate gap, not an oversight.
 # ----------------------------------------------------------------------------
 rule_files:
   - /etc/prometheus/rules/*.yml
@@ -45,8 +42,8 @@ rule_files:
 scrape_configs:
 
   # ---- Prometheus watching itself -----------------------------------------
-  # The cheapest proof that scraping works. localhost is correct here and only
-  # here: this target is inside the Prometheus container.
+  # localhost is correct here and only here: this target is inside the
+  # Prometheus container.
   - job_name: prometheus
     static_configs:
       - targets: ['localhost:9090']
@@ -55,9 +52,8 @@ scrape_configs:
   # Hostnames are container names on the dataplatform network. No IPs and no
   # localhost: Prometheus runs in its own container, where localhost is itself.
   #
-  # The `broker` label is added by hand so graphs and alerts can say "kafka-1"
-  # rather than "jmx-kafka-1:5556". Prometheus keeps the address in `instance`
-  # regardless, so nothing is lost.
+  # The `broker` label is added by hand so graphs and alerts say "kafka-1"
+  # rather than "jmx-kafka-1:5556".
   - job_name: kafka-jmx
     static_configs:
       - targets: ['jmx-kafka-1:5556']
@@ -99,26 +95,29 @@ scrape_configs:
   #  whenever that container is absent. Adding `postgres-exporter:9187` here
   #  would make this stack fail its own smoke test when started on its own,
   #  because a down target fires TargetDown. Every stack added later would
-  #  make the problem worse.
+  #  make it worse.
   #
   #  With discovery, Prometheus asks Docker what is running and scrapes only
-  #  containers that opted in. Nothing is red because nothing absent is
-  #  expected. A new exporter in any stack needs two labels on its service and
-  #  no change to this file:
+  #  containers that opted in. A new exporter in any stack needs labels on its
+  #  service and no change to this file:
   #
   #    labels:
   #      prometheus.scrape: "true"
   #      prometheus.port:   "9187"
-  #      prometheus.job:    "postgres"     # optional, defaults to docker-sd
+  #      prometheus.job:    "postgres"                       # optional
+  #      prometheus.path:   "/minio/v2/metrics/cluster"      # optional
   #
   #  Prometheus needs the Docker socket for this; see the compose file for how
-  #  it gets read access without running as root.
+  #  it gets read access without running as root, and why the group id is read
+  #  from the socket rather than hardcoded.
   # ==========================================================================
   - job_name: docker-sd
     docker_sd_configs:
       - host: unix:///var/run/docker.sock
         # How often to re-ask Docker what exists. Containers come and go
-        # rarely here, so 30s is plenty and costs nothing.
+        # rarely here, so 30s costs nothing — but it does mean a container
+        # started in the same wave as Prometheus is not discovered on the
+        # first pass, which looks like a broken exporter for half a minute.
         refresh_interval: 30s
 
     relabel_configs:
@@ -130,7 +129,7 @@ scrape_configs:
 
       # Opt-in. Containers without the label are dropped here and never
       # scraped — which is what keeps this from discovering Kafka brokers,
-      # Grafana and everything else that has no /metrics endpoint.
+      # Grafana and everything else with no /metrics endpoint.
       - source_labels: [__meta_docker_container_label_prometheus_scrape]
         regex: "true"
         action: keep
@@ -142,6 +141,13 @@ scrape_configs:
         regex: '([^:]+)(?::\d+)?;(\d+)'
         replacement: '$1:$2'
         target_label: __address__
+
+      # Metrics on a path other than /metrics. MinIO serves them at
+      # /minio/v2/metrics/cluster; ClickHouse, Postgres and the rest use the
+      # default, and anything without this label keeps it.
+      - source_labels: [__meta_docker_container_label_prometheus_path]
+        regex: '(.+)'
+        target_label: __metrics_path__
 
       # Use the declared job name, so metrics land under `postgres` rather
       # than all sharing the label `docker-sd`.

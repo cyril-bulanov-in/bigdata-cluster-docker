@@ -1,0 +1,5 @@
+# The S3 client and the Parquet writer. No Spark: this job moves one day of
+# one table, and a JVM plus a cluster to do it would be theatre.
+boto3==1.35.76
+pyarrow==18.1.0
+requests==2.32.3

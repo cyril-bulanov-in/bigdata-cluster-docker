@@ -37,7 +37,8 @@ AIRFLOW="http://localhost:${AF_PORT}"
 PROM="http://localhost:${PROM_PORT}"
 
 AF_COMPONENTS="airflow-apiserver airflow-scheduler airflow-dag-processor airflow-triggerer"
-EXPECTED_DAGS="00_docker_smoke 10_daily_sales"
+EXPECTED_DAGS="00_docker_smoke 10_daily_sales 20_export_orders"
+JOB_IMAGES="hello daily-sales export-orders"
 API_TIMEOUT=120
 
 # ---------------------------------------------------------------------------
@@ -136,7 +137,7 @@ done
 # ---------------------------------------------------------------------------
 info "Job images"
 
-for job in hello daily-sales; do
+for job in $JOB_IMAGES; do
   docker image inspect "dataplatform/job-${job}:${JOB_VERSION}" >/dev/null 2>&1 \
     && pass "dataplatform/job-${job}:${JOB_VERSION} exists" \
     || fail "dataplatform/job-${job}:${JOB_VERSION} is missing — run: make jobs"
@@ -184,17 +185,19 @@ done
   || fail "no airflow metrics after ${METRIC_TIMEOUT}s — Airflow pushes StatsD, so even an idle scheduler should emit heartbeats"
 
 # ---------------------------------------------------------------------------
-#  5. A job that actually does something
+#  5. Jobs that actually do something
 # ---------------------------------------------------------------------------
-#  Run directly, not through Airflow. When a mart is wrong the first question
+#  Run directly, not through Airflow. When output is wrong the first question
 #  is whether the job is wrong or the orchestration is, and this answers it
 #  without waiting for a schedule.
 # ---------------------------------------------------------------------------
-info "The mart job"
+info "The jobs"
 
 if [ "$SKIP_CLICKHOUSE" = "1" ]; then
   skip "mart job — SKIP_CLICKHOUSE is set"
   skip "mart contents — SKIP_CLICKHOUSE is set"
+  skip "S3 export job — SKIP_CLICKHOUSE is set"
+  skip "exported object — SKIP_CLICKHOUSE is set"
 else
   day=$(date -u -v-1d +%F 2>/dev/null || date -u -d yesterday +%F)
 
@@ -215,6 +218,42 @@ else
   [ "${rows:-0}" -gt 0 ] 2>/dev/null \
     && pass "${rows} category rows in the mart for ${day}" \
     || fail "the mart is empty for ${day} despite the job succeeding"
+
+  # ---- the S3 export -------------------------------------------------
+  # Only meaningful when MinIO is running, which it is not in stacks below
+  # 05. Absence is skipped rather than failed: this test belongs to 04 and
+  # must stay usable there.
+  if docker network inspect dataplatform >/dev/null 2>&1 \
+     && docker ps --format '{{.Names}}' | grep -qx minio; then
+
+    if docker run --rm --network dataplatform \
+         -e CLICKHOUSE_URL=http://clickhouse-01:8123 \
+         -e CLICKHOUSE_DB=analytics \
+         -e S3_ENDPOINT=http://minio:9000 \
+         -e S3_ACCESS_KEY="${S3_ACCESS_KEY:-minioadmin}" \
+         -e S3_SECRET_KEY="${S3_SECRET_KEY:-minioadmin}" \
+         -e S3_BUCKET="${S3_BUCKET:-raw}" \
+         -e TARGET_DATE="$day" \
+         "dataplatform/job-export-orders:${JOB_VERSION}" >/tmp/export_job.log 2>&1; then
+      pass "the S3 export ran for ${day} and exited zero"
+    else
+      fail "the S3 export failed for ${day}"
+      tail -10 /tmp/export_job.log | sed 's/^/        /'
+    fi
+
+    # The job verifies its own upload, but that verification lives inside the
+    # thing being tested. Checking from outside is what makes it a test.
+    if grep -q "verified:" /tmp/export_job.log 2>/dev/null; then
+      pass "$(grep -m1 'verified:' /tmp/export_job.log | sed 's/^ *//')"
+    elif grep -q "nothing to export" /tmp/export_job.log 2>/dev/null; then
+      pass "no orders on ${day} — nothing to export, which is a fact not a failure"
+    else
+      fail "the export produced no verified object"
+    fi
+  else
+    skip "S3 export job — MinIO is not running (stack 05)"
+    skip "exported object — MinIO is not running (stack 05)"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -222,8 +261,9 @@ info "Summary"
 printf '  %d passed, %d failed, %d skipped\n\n' "$PASSED" "$FAILED" "$SKIPPED"
 
 if [ "$SKIPPED" -gt 0 ]; then
-  echo "  The warehouse checks were skipped. Run without SKIP_CLICKHOUSE on a"
-  echo "  machine that can hold the ClickHouse cluster to cover them."
+  echo "  Some checks were skipped. Run without SKIP_CLICKHOUSE on a machine"
+  echo "  that can hold the ClickHouse cluster, and from 05-minio to include"
+  echo "  the object storage checks."
   echo ""
 fi
 

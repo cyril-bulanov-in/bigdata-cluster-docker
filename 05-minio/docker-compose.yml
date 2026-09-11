@@ -1,0 +1,116 @@
+# ============================================================================
+#  PLATFORM — step 5: object storage (part 1 — MinIO itself)
+# ============================================================================
+#
+#  S3-compatible storage. Buckets and lifecycle rules come in part 2, the job
+#  that reads and writes through them in part 3.
+#
+#  Start:  make up
+#  UI:     http://localhost:9001
+#
+# ----------------------------------------------------------------------------
+#  Why this exists before Spark
+# ----------------------------------------------------------------------------
+#  Spark without object storage either reads Kafka straight into ClickHouse —
+#  which ClickHouse already does by itself — or works on local files, which
+#  has nothing to do with the target architecture. With MinIO in place the
+#  jobs have a real task: read from Kafka or S3, write Parquet back, and do it
+#  through the same `s3a://` paths that will point at AWS S3 later with one
+#  environment variable changed.
+# ----------------------------------------------------------------------------
+include:
+  - ../04-etl/docker-compose.yml
+
+name: platform
+
+services:
+
+  # ==========================================================================
+  #  MinIO — S3-compatible object storage
+  # ==========================================================================
+  #  Single node, single drive. Enough to serve the protocol correctly, which
+  #  is all that matters here: the jobs talk S3 and cannot tell the difference.
+  #  Erasure coding and multi-node layouts are a storage exercise, not a data
+  #  engineering one.
+  #
+  #  No exporter: MinIO serves Prometheus metrics itself, like ClickHouse.
+  # ==========================================================================
+  minio:
+    image: minio/minio:${MINIO_VERSION}
+    container_name: minio
+    restart: unless-stopped
+    networks: [dataplatform]
+
+    # The API listens on 9000, the console needs its own port.
+    command: server /data --console-address ":9001"
+
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+
+      # Serve /minio/v2/metrics/cluster without a bearer token. The default
+      # requires a signed JWT, which Prometheus can be taught to send — but
+      # that means a second credential to keep in step for a stand where the
+      # endpoint is not reachable from outside the docker network anyway.
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+
+    volumes:
+      - minio-data:/data
+
+    ports:
+      # 9000 is the S3 API. It is free because ClickHouse's native port was
+      # deliberately published on 9010 back in step 3, for exactly this.
+      - "${MINIO_API_PORT}:9000"
+      - "${MINIO_CONSOLE_PORT}:9001"
+
+    labels:
+      # Discovered by docker-sd, like every exporter since step 2. The metrics
+      # path is not /metrics, so it is declared here too.
+      prometheus.scrape: "true"
+      prometheus.port: "9000"
+      prometheus.job: "minio"
+      prometheus.path: "/minio/v2/metrics/cluster"
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9000/minio/health/live || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 8
+      start_period: 20s
+
+  # ==========================================================================
+  #  One-shot: create the bucket layout
+  # ==========================================================================
+  #  Runs to completion and exits, like airflow-init in step 4. Everything it
+  #  does is idempotent, so `make up` can call it on every start without a
+  #  guard: buckets are created only if absent, policies are set to a fixed
+  #  state rather than appended to.
+  #
+  #  A separate container rather than a Makefile target, because the layout is
+  #  part of the stack rather than something an operator remembers to run. A
+  #  fresh clone and `make up` produces the same buckets with the same rules.
+  # ==========================================================================
+  minio-init:
+    image: minio/mc:${MC_VERSION}
+    container_name: minio-init
+    restart: "no"
+    networks: [dataplatform]
+    environment:
+      MINIO_URL: http://minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      BUCKET_RAW: ${BUCKET_RAW}
+      BUCKET_STAGED: ${BUCKET_STAGED}
+      BUCKET_CURATED: ${BUCKET_CURATED}
+      RAW_RETENTION_DAYS: ${RAW_RETENTION_DAYS}
+    volumes:
+      - ./minio/init.sh:/init.sh:ro
+    # The mc image has an entrypoint of its own that expects an mc subcommand,
+    # so it has to be replaced rather than appended to.
+    entrypoint: ["/bin/sh", "/init.sh"]
+    depends_on:
+      minio:
+        condition: service_healthy
+
+volumes:
+  minio-data:

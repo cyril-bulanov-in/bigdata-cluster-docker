@@ -1,0 +1,160 @@
+# ============================================================================
+#  Alerting rules for the 05-minio stack
+# ============================================================================
+#  Lives here because Prometheus mounts one rules directory and each stack
+#  contributes a file named after itself. Rules for a stack that is not
+#  running reference metrics that do not exist and stay inactive.
+#
+#  ---------------------------------------------------------------------------
+#  Every metric name below was checked against a running MinIO
+#  ---------------------------------------------------------------------------
+#  Two of the names in the first draft of this file did not exist —
+#  minio_bucket_usage_version_total and minio_bucket_usage_object_total, both
+#  invented by analogy. The real counters are cluster-wide and named
+#  minio_cluster_usage_*, with no bucket label at all.
+#
+#  A rule naming a metric that does not exist never fires and never complains.
+#  It sits in the UI looking like coverage, which is worse than not having it.
+#  Re-check after any MinIO upgrade:
+#
+#      curl -s 'http://localhost:9090/api/v1/label/__name__/values' \
+#        | tr ',' '\n' | grep -o 'minio_[a-z_]*' | sort -u
+#
+#  MinIO serves these on /minio/v2/metrics/cluster rather than /metrics, which
+#  is why the container carries a prometheus.path label and why docker-sd has
+#  a rule for __metrics_path__.
+# ============================================================================
+
+groups:
+
+  - name: minio
+    rules:
+
+      # The endpoint itself. Without it every rule below goes quiet, which
+      # would otherwise look like perfectly healthy storage.
+      - alert: MinioMetricsMissing
+        expr: up{job="minio"} == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MinIO is not being scraped"
+          description: "Every other MinIO alert is blind while this is true."
+
+      # MinIO's own verdict on itself. 1 is healthy.
+      - alert: MinioUnhealthy
+        expr: minio_cluster_health_status != 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MinIO reports itself unhealthy"
+
+      # Free space. Object storage fills silently: writes keep succeeding at
+      # full speed right up until they do not, and the job that fails is
+      # whichever one happened to be running.
+      - alert: MinioLowDiskSpace
+        expr: |
+          minio_cluster_capacity_usable_free_bytes
+            / minio_cluster_capacity_usable_total_bytes * 100 < 15
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MinIO has {{ $value | printf \"%.0f\" }}% usable space left"
+
+      - alert: MinioDiskSpaceCritical
+        expr: |
+          minio_cluster_capacity_usable_free_bytes
+            / minio_cluster_capacity_usable_total_bytes * 100 < 5
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MinIO has {{ $value | printf \"%.0f\" }}% usable space left"
+          description: "Writes will start failing. Check lifecycle rules: make buckets"
+
+      # A drive that has gone offline. On a single-node stand this means the
+      # store is down; on a real deployment it is the difference between
+      # degraded and lost.
+      - alert: MinioDrivesOffline
+        expr: minio_cluster_drive_offline_total > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value }} MinIO drive(s) offline"
+
+      # Errors answering S3 requests. Any sustained rate means jobs are
+      # failing to read or write, and a job that retries can hide that for a
+      # long time.
+      - alert: MinioS3Errors
+        expr: rate(minio_s3_requests_errors_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MinIO is returning {{ $value | printf \"%.2f\" }} S3 errors/s"
+
+  # --------------------------------------------------------------------------
+  #  Lifecycle
+  # --------------------------------------------------------------------------
+  #  These watch our own configuration rather than MinIO's health, and they
+  #  exist because a versioned bucket accumulates quietly. Every overwrite
+  #  keeps the old copy, the console shows only current versions, and the
+  #  total looks fine while the storage grows.
+  #
+  #  minio_node_ilm_* are direct observations of the expiry machinery, which
+  #  is better than inferring from version counts: they say whether the rules
+  #  are being applied, not whether their effect happens to be visible yet.
+  # --------------------------------------------------------------------------
+  - name: minio-lifecycle
+    rules:
+
+      # Expiry tasks queueing up rather than being processed. A backlog that
+      # does not drain means the rules exist and are not taking effect.
+      - alert: MinioLifecycleBacklog
+        expr: minio_node_ilm_expiry_pending_tasks > 1000
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} lifecycle expiry tasks pending on {{ $labels.instance }}"
+
+      # Tasks the scanner skipped. Any nonzero rate means objects that should
+      # have been expired were not, and the bucket keeps growing.
+      - alert: MinioLifecycleMissedTasks
+        expr: increase(minio_node_ilm_expiry_missed_tasks[1h]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MinIO missed {{ $value }} lifecycle expiry tasks in the last hour"
+
+      # Noncurrent versions specifically. This is the one that costs money:
+      # the versions kept by every overwrite, which nothing in the console
+      # shows and which only the lifecycle rule removes.
+      - alert: MinioMissedFreeVersions
+        expr: increase(minio_node_ilm_expiry_missed_freeversions[1h]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MinIO missed {{ $value }} noncurrent versions for expiry"
+          description: "Old versions are accumulating. Check: make buckets"
+
+      # Versions per object across the cluster. A blunt instrument, kept as a
+      # backstop: if the ilm counters above are healthy and this still climbs,
+      # the rules are running but not matching what is being written.
+      #
+      # Cluster-wide, not per bucket: MinIO exposes no bucket label on these.
+      - alert: MinioVersionsGrowing
+        expr: |
+          minio_cluster_usage_version_total
+            / clamp_min(minio_cluster_usage_object_total, 1) > 10
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} versions per object across the cluster"
+          description: "Noncurrent version expiry may not be applied. Check: make buckets"
