@@ -39,6 +39,8 @@ x-spark: &spark
       SPARK_IMAGE: ${SPARK_IMAGE}
       HADOOP_AWS_VERSION: ${HADOOP_AWS_VERSION}
       AWS_SDK_VERSION: ${AWS_SDK_VERSION}
+      SPARK_VERSION_FULL: ${SPARK_VERSION}
+      SCALA_BINARY: ${SCALA_BINARY}
   image: dataplatform/spark:${SPARK_VERSION}
   restart: unless-stopped
   networks: [dataplatform]

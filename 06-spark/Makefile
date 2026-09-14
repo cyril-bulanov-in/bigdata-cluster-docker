@@ -26,6 +26,16 @@ SPARK_VERSION := $(or $(call getenv,SPARK_VERSION,$(ENV)),3.5.9)
 UI_PORT       := $(or $(call getenv,SPARK_MASTER_UI_PORT,$(ENV)),8090)
 PROM_PORT     := $(or $(call getenv,PROMETHEUS_PORT,$(MON_ENV)),9090)
 
+JOB_VERSION   := $(or $(call getenv,JOB_VERSION,$(ENV)),0.1.0)
+EXEC_MEMORY   := $(or $(call getenv,SPARK_EXECUTOR_MEMORY,$(ENV)),1g)
+EXEC_CORES    := $(or $(call getenv,SPARK_EXECUTOR_CORES,$(ENV)),1)
+CORES_MAX     := $(or $(call getenv,SPARK_CORES_MAX,$(ENV)),4)
+DRIVER_MEMORY := $(or $(call getenv,SPARK_DRIVER_MEMORY,$(ENV)),1g)
+S3_ENDPOINT   := $(or $(call getenv,S3_ENDPOINT,$(ENV)),http://minio:9000)
+MINIO_USER    := $(or $(call getenv,MINIO_ROOT_USER,$(ENV)),minioadmin)
+MINIO_PASS    := $(or $(call getenv,MINIO_ROOT_PASSWORD,$(ENV)),minioadmin)
+MC_VERSION    := $(or $(call getenv,MC_VERSION,$(MINIO_ENV)),latest)
+
 PROM  := http://localhost:$(PROM_PORT)
 SPARK := http://localhost:$(UI_PORT)
 
@@ -33,7 +43,7 @@ WORKERS := spark-worker-1 spark-worker-2 spark-worker-3 spark-worker-4
 
 .DEFAULT_GOAL := help
 .PHONY: help check-env up up-light down restart clean ps logs config urls \
-        cluster spark-shell spark-logs spark-metrics jars smoke test
+        cluster spark-shell spark-logs spark-metrics jars smoke test jobs spark-job staged staged-ls
 
 help: ## show this list
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
@@ -51,6 +61,7 @@ check-env:
 
 up: check-env ## start the whole platform including Spark
 	$(COMPOSE) up -d --build
+	@$(MAKE) --no-print-directory jobs
 	@$(MAKE) --no-print-directory urls
 
 up-light: ## start without the ClickHouse cluster
@@ -74,6 +85,80 @@ urls: ## print the web interfaces
 	@echo "  Grafana        http://localhost:3000"
 	@echo "  Prometheus     $(PROM)"
 	@echo ""
+
+# --- job images -------------------------------------------------------------
+
+# Built FROM the cluster image, so driver and executors run the same Spark
+# build and the same jars. Two images that drifted apart produce serialisation
+# errors naming a class and not the reason.
+jobs: ## build the Spark job images
+	@for d in jobs/*/; do \
+	   name=$$(basename $$d); \
+	   printf 'building dataplatform/spark-job-%s:%s ... ' "$$name" "$(JOB_VERSION)"; \
+	   docker build -q \
+	     --build-arg SPARK_IMAGE_LOCAL=dataplatform/spark:$(SPARK_VERSION) \
+	     -t dataplatform/spark-job-$$name:$(JOB_VERSION) $$d >/dev/null \
+	     && echo "ok" || { echo "FAILED"; exit 1; }; \
+	 done
+
+# ---------------------------------------------------------------------------
+#  Note --name and --hostname, and why both are needed
+# ---------------------------------------------------------------------------
+#  This runs in client mode: the driver is inside this container, the
+#  executors are on the workers, and the executors connect BACK to the driver.
+#  They need a name that resolves to it.
+#
+#  Left alone, Spark advertises whatever the container thinks its hostname is
+#  — a random hex id no other container can resolve. The job then starts, gets
+#  executors, and hangs: the driver waits for executors that are failing to
+#  reach it, and nothing in the driver log says so.
+#
+#  --name gives Docker's DNS something to resolve on the platform network,
+#  --hostname makes the container agree, and SPARK_DRIVER_HOST tells Spark to
+#  advertise that name rather than guess.
+# ---------------------------------------------------------------------------
+# The transformation. TARGET_DATE restricts it to one day; empty processes
+# every partition present in the source.
+staged: ## run raw -> staged (DATE=YYYY-MM-DD, DRY_RUN=1)
+	@docker run --rm --network dataplatform \
+	   --name spark-driver --hostname spark-driver \
+	   -e SPARK_MASTER_URL=spark://spark-master:7077 \
+	   -e SPARK_DRIVER_HOST=spark-driver \
+	   -e SPARK_DRIVER_MEMORY=$(DRIVER_MEMORY) \
+	   -e SPARK_EXECUTOR_MEMORY=$(EXEC_MEMORY) \
+	   -e SPARK_EXECUTOR_CORES=$(EXEC_CORES) \
+	   -e SPARK_CORES_MAX=$(CORES_MAX) \
+	   -e S3_ENDPOINT=$(S3_ENDPOINT) \
+	   -e AWS_ACCESS_KEY_ID=$(MINIO_USER) \
+	   -e AWS_SECRET_ACCESS_KEY=$(MINIO_PASS) \
+	   -e SRC_BUCKET=$${SRC_BUCKET:-raw} \
+	   -e DST_BUCKET=$${DST_BUCKET:-staged} \
+	   -e TARGET_DATE=$${DATE:-} \
+	   -e DRY_RUN=$${DRY_RUN:-0} \
+	   dataplatform/spark-job-orders-staged:$(JOB_VERSION)
+
+staged-ls: ## what is in the staged bucket
+	@docker run --rm --network dataplatform \
+	   -e "MC_HOST_local=http://$(MINIO_USER):$(MINIO_PASS)@minio:9000" \
+	   minio/mc:$(MC_VERSION) ls --recursive local/staged 2>/dev/null \
+	   | sed 's/^/  /' || echo "  nothing in staged yet — run: make staged"
+
+spark-job: ## run the smoke job on the cluster (JOB=spark-smoke)
+	@job=$${JOB:-spark-smoke}; \
+	 docker run --rm --network dataplatform \
+	   --name spark-driver --hostname spark-driver \
+	   -e SPARK_MASTER_URL=spark://spark-master:7077 \
+	   -e SPARK_DRIVER_HOST=spark-driver \
+	   -e SPARK_DRIVER_MEMORY=$(DRIVER_MEMORY) \
+	   -e SPARK_EXECUTOR_MEMORY=$(EXEC_MEMORY) \
+	   -e SPARK_EXECUTOR_CORES=$(EXEC_CORES) \
+	   -e SPARK_CORES_MAX=$(CORES_MAX) \
+	   -e S3_ENDPOINT=$(S3_ENDPOINT) \
+	   -e AWS_ACCESS_KEY_ID=$(MINIO_USER) \
+	   -e AWS_SECRET_ACCESS_KEY=$(MINIO_PASS) \
+	   -e S3_BUCKET=$${S3_BUCKET:-raw} \
+	   -e S3_PREFIX=$${S3_PREFIX:-orders} \
+	   dataplatform/spark-job-$$job:$(JOB_VERSION)
 
 # --- the cluster ------------------------------------------------------------
 

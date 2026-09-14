@@ -37,7 +37,7 @@ AIRFLOW="http://localhost:${AF_PORT}"
 PROM="http://localhost:${PROM_PORT}"
 
 AF_COMPONENTS="airflow-apiserver airflow-scheduler airflow-dag-processor airflow-triggerer"
-EXPECTED_DAGS="00_docker_smoke 10_daily_sales 20_export_orders"
+EXPECTED_DAGS="00_docker_smoke 10_daily_sales 20_export_orders 30_orders_to_staged"
 JOB_IMAGES="hello daily-sales export-orders"
 API_TIMEOUT=120
 

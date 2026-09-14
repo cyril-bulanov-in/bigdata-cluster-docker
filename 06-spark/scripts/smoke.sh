@@ -183,9 +183,16 @@ printf '%s' "$conf" | grep -q 'fs.s3a.path.style.access.*true' \
   && pass "path-style addressing is on" \
   || fail "path-style addressing is off — bucket.minio does not resolve"
 
-printf '%s' "$conf" | grep -q 'fs.s3a.committer.name.*directory' \
-  && pass "the directory committer is configured" \
-  || fail "no S3 committer — the default renames files, and S3 has no rename"
+# The magic committer specifically, not just any committer.
+#
+# The staging committers — directory and partitioned — keep metadata about
+# their uploaded parts in a local directory and expect the driver and every
+# executor to see the same one. In containers they do not, and the job then
+# succeeds while writing only _SUCCESS into an empty prefix. Asserting the
+# name rather than merely its presence is what keeps that from coming back.
+printf '%s' "$conf" | grep -q 'fs.s3a.committer.name.*magic' \
+  && pass "the magic committer is configured" \
+  || fail "the magic committer is not set — staging committers lose data across containers"
 
 # ---------------------------------------------------------------------------
 #  5. Metrics
@@ -215,6 +222,73 @@ done
 [ "${w_targets:-0}" -ge "$EXPECTED_WORKERS" ] \
   && pass "Prometheus is scraping ${w_targets} workers" \
   || fail "${w_targets:-0} spark-worker targets, expected ${EXPECTED_WORKERS}"
+
+# ---------------------------------------------------------------------------
+#  6. A job that actually runs on the cluster
+# ---------------------------------------------------------------------------
+#  Everything above proves the cluster is assembled. This proves it does work.
+#
+#  Skipped when the source is empty rather than failed: the raw layer is
+#  filled by the export job in 04-etl, which needs ClickHouse, and continuous
+#  integration runs without the warehouse. A test that fails on something it
+#  was never given teaches people to ignore it.
+# ---------------------------------------------------------------------------
+info "A job on the cluster"
+
+JOB_VERSION="$(read_env JOB_VERSION .env)"; JOB_VERSION="${JOB_VERSION:-0.1.0}"
+MINIO_USER="$(read_env MINIO_ROOT_USER .env)";     MINIO_USER="${MINIO_USER:-minioadmin}"
+MINIO_PASS="$(read_env MINIO_ROOT_PASSWORD .env)"; MINIO_PASS="${MINIO_PASS:-minioadmin}"
+MC_VERSION="$(read_env MC_VERSION ../05-minio/.env)"; MC_VERSION="${MC_VERSION:-latest}"
+
+mc() {
+  docker run --rm --network dataplatform \
+    -e "MC_HOST_local=http://${MINIO_USER}:${MINIO_PASS}@minio:9000" \
+    "minio/mc:${MC_VERSION}" "$@" 2>/dev/null | tr -d '\r' || true
+}
+
+raw_objects=$(mc ls --recursive local/raw/orders/ | grep -c 'parquet' || true)
+
+if ! docker ps --format '{{.Names}}' | grep -qx minio; then
+  skip "the transformation — MinIO is not running"
+  skip "its output — MinIO is not running"
+elif ! docker image inspect "dataplatform/spark-job-orders-staged:${JOB_VERSION}" >/dev/null 2>&1; then
+  fail "dataplatform/spark-job-orders-staged:${JOB_VERSION} is missing — run: make jobs"
+  skip "its output — the image is missing"
+elif [ "${raw_objects:-0}" -eq 0 ]; then
+  skip "the transformation — s3://raw/orders/ is empty, run the export in 04-etl"
+  skip "its output — nothing to transform"
+else
+  if docker run --rm --network dataplatform \
+       --name spark-driver-smoke --hostname spark-driver-smoke \
+       -e SPARK_MASTER_URL=spark://spark-master:7077 \
+       -e SPARK_DRIVER_HOST=spark-driver-smoke \
+       -e SPARK_DRIVER_MEMORY="${SPARK_DRIVER_MEMORY:-1g}" \
+       -e SPARK_EXECUTOR_MEMORY="${SPARK_EXECUTOR_MEMORY:-1g}" \
+       -e SPARK_EXECUTOR_CORES="${SPARK_EXECUTOR_CORES:-1}" \
+       -e SPARK_CORES_MAX="${SPARK_CORES_MAX:-4}" \
+       -e S3_ENDPOINT=http://minio:9000 \
+       -e AWS_ACCESS_KEY_ID="${MINIO_USER}" \
+       -e AWS_SECRET_ACCESS_KEY="${MINIO_PASS}" \
+       "dataplatform/spark-job-orders-staged:${JOB_VERSION}" >/tmp/staged_smoke.log 2>&1; then
+    pass "the transformation ran and exited zero"
+  else
+    fail "the transformation failed"
+    tail -12 /tmp/staged_smoke.log | sed 's/^/        /'
+  fi
+
+  # Exiting zero is not the same as writing data. This stack has already
+  # produced the exact failure this checks for: the magic committer wrote
+  # _SUCCESS into an otherwise empty prefix, because the staging committers it
+  # replaced had left every data file in a local directory the driver could
+  # not see. The job succeeded and the bucket held nothing.
+  data_files=$(mc ls --recursive local/staged/orders/ | grep -c '\.parquet' || true)
+  if [ "${data_files:-0}" -gt 0 ]; then
+    pass "${data_files} parquet file(s) in s3://staged/orders/"
+  else
+    fail "s3://staged/orders/ holds no parquet — check for a lone _SUCCESS marker"
+    mc ls --recursive local/staged/orders/ | head -5 | sed 's/^/        /'
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 info "Summary"
