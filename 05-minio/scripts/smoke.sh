@@ -220,7 +220,7 @@ probe_body="smoke test $(date -u +%FT%TZ) $$"
 # but this way the failure of each half is distinguishable.
 if docker run --rm --network dataplatform \
      -e "MC_HOST_local=http://${MINIO_USER}:${MINIO_PASS}@minio:9000" \
-     --entrypoint sh "minio/mc:${MC_VERSION}" \
+     --entrypoint sh "${MC_IMAGE}:${MC_VERSION}" \
      -c "printf '%s' '${probe_body}' | mc pipe local/${RAW}/${probe_key}" \
      >/dev/null 2>&1; then
   pass "wrote s3://${RAW}/${probe_key}"
@@ -230,7 +230,7 @@ fi
 
 fetched=$(docker run --rm --network dataplatform \
   -e "MC_HOST_local=http://${MINIO_USER}:${MINIO_PASS}@minio:9000" \
-  --entrypoint sh "minio/mc:${MC_VERSION}" \
+  --entrypoint sh "${MC_IMAGE}:${MC_VERSION}" \
   -c "mc cat local/${RAW}/${probe_key}" 2>/dev/null | tr -d '\r' || true)
 
 if [ "$fetched" = "$probe_body" ]; then
