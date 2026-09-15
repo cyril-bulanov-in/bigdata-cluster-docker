@@ -157,21 +157,50 @@ def main() -> int:
     # different file. Changing the committer back to `directory` would turn
     # this line into the month-destroying kind without changing this line.
     started = time.monotonic()
-    (
-        staged.write
-        .mode("overwrite")
-        .partitionBy("dt")
-        .parquet(dst)
-    )
+
+    if TARGET_DATE:
+        # Write straight into the one partition's prefix, without partitionBy.
+        #
+        # This is the only way to replace a single day that works with any
+        # committer, and it exists because the two obvious approaches do not.
+        #
+        # mode("overwrite") with partitionBy is STATIC overwrite: it deletes
+        # the entire destination and writes what this run produced. Processing
+        # one day would silently destroy every other day — which is exactly
+        # what happened here before this branch existed.
+        #
+        # partitionOverwriteMode=dynamic would fix that, and the S3A committers
+        # reject it outright ("PathOutputCommitter does not support
+        # dynamicPartitionOverwrite"). The staging committers' conflict-mode
+        # is not a substitute: the magic committer ignores it entirely.
+        #
+        # Writing to dt=<date>/ directly sidesteps all of it. Overwrite then
+        # means "replace this prefix", which is the intent.
+        #
+        # dt is dropped from the columns because it is in the path. Leaving it
+        # would store the same value in both places, and a reader deriving it
+        # from the path would find two columns of the same name.
+        partition_path = f"{dst}dt={TARGET_DATE}/"
+        print(f"writing one partition: {partition_path}")
+        staged.drop("dt").write.mode("overwrite").parquet(partition_path)
+    else:
+        # Every partition is being rebuilt, so replacing the whole destination
+        # is what was asked for.
+        print(f"writing every partition to {dst}")
+        staged.write.mode("overwrite").partitionBy("dt").parquet(dst)
     print(f"\nwrote in {time.monotonic() - started:.1f}s")
 
     # ---- verify -----------------------------------------------------------
     # Reading back is not ceremony. A write that returns without raising and a
     # dataset that can be read are different claims, and object storage is
     # where they come apart.
-    check = spark.read.parquet(dst)
+        # Read back exactly what was written, not the whole destination. Reading
+    # the root makes Spark discover every partition, which fails on a stale
+    # listing and says nothing about the write that just happened.
     if TARGET_DATE:
-        check = check.where(F.col("dt") == F.lit(TARGET_DATE))
+        check = spark.read.parquet(f"{dst}dt={TARGET_DATE}/")
+    else:
+        check = spark.read.parquet(dst)
     written = check.count()
 
     if written != deduped_rows:
@@ -179,10 +208,16 @@ def main() -> int:
         spark.stop()
         return 1
 
-    print(f"verified    : {written} rows read back from {dst}")
+    print(f"verified    : {written} rows read back")
     print("\npartitions written:")
-    for row in check.groupBy("dt").count().orderBy("dt").collect():
-        print(f"  dt={row['dt']}  {row['count']} rows")
+    if TARGET_DATE:
+        # dt is not a column here: writing into dt=<date>/ puts the value in
+        # the path instead, and reading that prefix directly gives no partition
+        # discovery. The value is known — it is what was asked for.
+        print(f"  dt={TARGET_DATE}  {written} rows")
+    else:
+        for row in check.groupBy("dt").count().orderBy("dt").collect():
+            print(f"  dt={row['dt']}  {row['count']} rows")
 
     spark.stop()
     return 0
