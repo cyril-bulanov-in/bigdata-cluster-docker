@@ -79,49 +79,33 @@ jobs:
         run: make config
 
       # ----------------------------------------------------------------------
-      #  Build before pulling, and pull before starting
+      #  Build everything buildable before starting anything
       # ----------------------------------------------------------------------
       #  `docker compose up --build` looks like it covers this and does not.
-      #  It pulls every image that has no build section of its own — and three
-      #  images in this platform are built by one service and merely
-      #  referenced by another. jmx-connect in 03-dbms names
-      #  dataplatform/jmx-exporter, which jmx-kafka-* in 02-monitoring builds;
-      #  from compose's point of view that is an image to fetch from a
-      #  registry where it has never existed:
+      #  It builds and pulls concurrently, and three images in this platform
+      #  are built by one service and merely referenced by another:
+      #  jmx-connect in 03-dbms names dataplatform/jmx-exporter, which
+      #  jmx-kafka-* in 02-monitoring builds. From compose's point of view
+      #  that is an image to fetch from a registry where it has never existed:
       #
       #      pull access denied for dataplatform/jmx-exporter,
       #      repository does not exist or may require 'docker login'
       #
       #  Locally this never appears, because the image is already there from
-      #  an earlier build. It only shows up on a clean machine, which is
+      #  an earlier build. It shows up only on a clean machine, which is
       #  precisely what a runner is.
       #
-      #  Building everything buildable first puts those images in the local
-      #  store, so the later pull skips them.
+      #  Note that `docker compose pull --ignore-buildable` does NOT solve it.
+      #  That flag asks whether the service being pulled has a build section
+      #  of its own — jmx-connect does not — rather than whether the image
+      #  already exists locally. It skips jmx-kafka-* and then tries to fetch
+      #  the very image they produce.
+      #
+      #  Building first and letting `up` fetch the rest works, because `up`
+      #  pulls only what is missing.
       # ----------------------------------------------------------------------
       - name: Build every locally built image
         run: docker compose build
-
-      # ----------------------------------------------------------------------
-      #  Anonymous pulls from Docker Hub fail intermittently on runners — rate
-      #  limits and transient auth errors both surface as "pull access denied
-      #  ... repository does not exist", which reads like a typo in the image
-      #  name rather than a temporary condition.
-      #
-      #  --ignore-buildable skips what the previous step already built.
-      # ----------------------------------------------------------------------
-      - name: Pull the external images, with retries
-        run: |
-          for attempt in 1 2 3; do
-            if docker compose pull --ignore-buildable; then
-              echo "pulled on attempt ${attempt}"
-              exit 0
-            fi
-            echo "pull attempt ${attempt} failed, retrying in 20s"
-            sleep 20
-          done
-          echo "could not pull the external images after three attempts"
-          exit 1
 
       # Built FROM the cluster image, so this must follow the build above. Out
       # of order, the job images inherit a stale Spark and the driver and
@@ -130,8 +114,22 @@ jobs:
       - name: Build the job images
         run: make jobs
 
+      # Anonymous pulls from Docker Hub fail intermittently on runners. Both a
+      # rate limit and a transient auth error surface as "pull access denied
+      # ... repository does not exist", which reads like a typo in the image
+      # name rather than something that will work on the next attempt.
       - name: Start the platform and the Spark cluster
-        run: make up-light
+        run: |
+          for attempt in 1 2 3; do
+            if make up-light; then
+              echo "started on attempt ${attempt}"
+              exit 0
+            fi
+            echo "attempt ${attempt} failed, retrying in 30s"
+            sleep 30
+          done
+          echo "could not start after three attempts"
+          exit 1
 
       - name: Smoke test
         run: make smoke
