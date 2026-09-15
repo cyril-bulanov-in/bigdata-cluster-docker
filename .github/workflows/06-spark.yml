@@ -5,7 +5,6 @@
 # The transformation itself needs data in s3://raw/, which is produced by a
 # job that reads ClickHouse — absent here. That check prints as SKIP; see
 # "What continuous integration does not cover" in 06-spark/README.md.
-# comment to skip....
 
 name: 06-spark
 
@@ -79,17 +78,55 @@ jobs:
       - name: Validate the compose file and every include
         run: make config
 
-      # Its own step, because this is where it is most likely to fail: three
-      # jars from Maven Central, and the build verifies their contents rather
-      # than trusting that a download succeeded. A failure here is about the
-      # image, not about the cluster.
-      - name: Build the Spark image
-        run: docker compose build spark-master
+      # ----------------------------------------------------------------------
+      #  Build before pulling, and pull before starting
+      # ----------------------------------------------------------------------
+      #  `docker compose up --build` looks like it covers this and does not.
+      #  It pulls every image that has no build section of its own — and three
+      #  images in this platform are built by one service and merely
+      #  referenced by another. jmx-connect in 03-dbms names
+      #  dataplatform/jmx-exporter, which jmx-kafka-* in 02-monitoring builds;
+      #  from compose's point of view that is an image to fetch from a
+      #  registry where it has never existed:
+      #
+      #      pull access denied for dataplatform/jmx-exporter,
+      #      repository does not exist or may require 'docker login'
+      #
+      #  Locally this never appears, because the image is already there from
+      #  an earlier build. It only shows up on a clean machine, which is
+      #  precisely what a runner is.
+      #
+      #  Building everything buildable first puts those images in the local
+      #  store, so the later pull skips them.
+      # ----------------------------------------------------------------------
+      - name: Build every locally built image
+        run: docker compose build
 
-      # Built FROM the cluster image, so this must follow it. Out of order,
-      # the job images inherit a stale Spark and the driver and executors
-      # disagree — which surfaces as ClassCastException on SerializedLambda,
-      # naming neither versions nor images.
+      # ----------------------------------------------------------------------
+      #  Anonymous pulls from Docker Hub fail intermittently on runners — rate
+      #  limits and transient auth errors both surface as "pull access denied
+      #  ... repository does not exist", which reads like a typo in the image
+      #  name rather than a temporary condition.
+      #
+      #  --ignore-buildable skips what the previous step already built.
+      # ----------------------------------------------------------------------
+      - name: Pull the external images, with retries
+        run: |
+          for attempt in 1 2 3; do
+            if docker compose pull --ignore-buildable; then
+              echo "pulled on attempt ${attempt}"
+              exit 0
+            fi
+            echo "pull attempt ${attempt} failed, retrying in 20s"
+            sleep 20
+          done
+          echo "could not pull the external images after three attempts"
+          exit 1
+
+      # Built FROM the cluster image, so this must follow the build above. Out
+      # of order, the job images inherit a stale Spark and the driver and
+      # executors disagree — which surfaces as ClassCastException on
+      # SerializedLambda, naming neither versions nor images.
       - name: Build the job images
         run: make jobs
 
@@ -107,6 +144,9 @@ jobs:
           echo ""
           echo "=== memory ==="
           free -h
+          echo ""
+          echo "=== images present locally ==="
+          docker images --format '{{.Repository}}:{{.Tag}}' | sort | head -40
           echo ""
           echo "=== the master's view ==="
           curl -s http://localhost:8090/json/ || true

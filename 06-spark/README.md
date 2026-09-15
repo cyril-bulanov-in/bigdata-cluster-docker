@@ -139,17 +139,54 @@ The smoke test asserts the committer is `magic` by name, not merely that one
 is set, and counts parquet files in the destination rather than trusting the
 exit code.
 
-### Dynamic partition overwrite comes from the committer
+### Replacing one day, and why the obvious ways do not work
 
-The job writes with `mode("overwrite")` and **no**
-`partitionOverwriteMode` option. Replacing only the partitions this run
-produced — rather than deleting every other day in the destination — is the
-committer's `conflict-mode`, not a Spark option. Asking for both is what
-produces the error above.
+The job writes a single day into `s3a://staged/orders/dt=<date>/` directly,
+without `partitionBy`. That looks like the crude option and is the only one
+that works here. Both alternatives were tried:
 
-So that `overwrite` is safe because of a setting in a different file. Change
-the committer and the same line becomes the month-destroying kind without
-changing.
+**`mode("overwrite")` with `partitionBy`** is *static* overwrite: it deletes
+the entire destination and writes what this run produced. Processing one day
+silently destroys every other day. This is not theoretical — it is what
+happened here, and the next run failed with
+`FileNotFoundException: s3a://staged/orders/dt=2026-09-06` on a partition that
+had existed minutes earlier.
+
+**`partitionOverwriteMode=dynamic`** is Spark's fix for exactly that, and the
+S3A committers reject it:
+
+```
+PathOutputCommitter does not support dynamicPartitionOverwrite
+```
+
+**The staging committers' `conflict-mode=replace`** looks like a substitute
+and is not: the magic committer ignores the setting entirely. Believing
+otherwise is what produced the deletion above.
+
+Writing into `dt=<date>/` sidesteps all of it. Overwrite then means "replace
+this prefix", which is the intent. `dt` is dropped from the columns because it
+is in the path; leaving it would store the value twice and give a reader
+deriving it from the path two columns of the same name.
+
+When no date is given the job rebuilds everything, and there `partitionBy`
+with a whole-destination overwrite is correct — that is what was asked for.
+
+### Credentials come from the environment
+
+`spark.hadoop.fs.s3a.aws.credentials.provider` is
+`EnvironmentVariableCredentialsProvider`, not the `SimpleAWSCredentialsProvider`
+most examples use.
+
+Simple reads `fs.s3a.access.key` and `fs.s3a.secret.key` — configuration
+properties. Every job passes them with `--conf`, so jobs worked; anything
+started from the image without that entrypoint did not. `make spark-shell`
+failed with `InvalidAccessKeyId` while the identical read from a job
+succeeded, which is a confusing pair of facts to hold at once.
+
+The environment provider reads `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY`, which the compose file already sets on every node. It
+is also what an AWS deployment uses, with the variables supplied by the task
+role.
 
 ## The jobs
 
@@ -281,8 +318,21 @@ make staged && make staged-ls
 ```
 
 Four workers at 8 GiB is 32 GiB for Spark alone, on top of roughly 24 for the
-rest of the platform. Lower `SPARK_WORKER_MEMORY` and `SPARK_EXECUTOR_MEMORY`
-together — lowering only one does nothing.
+rest of the platform — this stack wants Docker set to 64 GiB or more.
+
+Note that Spark *reserves* rather than uses it: a worker handling this much
+data sits at a few hundred MiB. ClickHouse is the one that actually consumes
+its limit, and raising Spark's reservation is what starved it the first time:
+
+```
+Code: 241. (total) memory limit exceeded: current RSS: 1.16 GiB, maximum: 1.16 GiB
+```
+
+ClickHouse reads its cgroup limit and takes 70% of it, so the fix was
+`CLICKHOUSE_MEM_LIMIT` in `../03-dbms/.env`, not anything in this stack.
+
+Lower `SPARK_WORKER_MEMORY` and `SPARK_EXECUTOR_MEMORY` together — lowering
+only one does nothing, for the reason above.
 
 ## Commands
 

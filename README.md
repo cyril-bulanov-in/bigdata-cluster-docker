@@ -5,6 +5,7 @@
 [![03-dbms](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/03-dbms.yml/badge.svg?branch=main)](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/03-dbms.yml)
 [![04-etl](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/04-etl.yml/badge.svg?branch=main)](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/04-etl.yml)
 [![05-minio](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/05-minio.yml/badge.svg?branch=main)](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/05-minio.yml)
+[![06-spark](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/06-spark.yml/badge.svg?branch=main)](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/06-spark.yml)
 
 A working data platform, assembled with Docker Compose one component at a time.
 
@@ -35,9 +36,11 @@ application, a dbt project, a Python transformation. The container is a unit of
 delivery, not a way to host a service. Airflow starts it, it does its work,
 it exits.
 
-Step 4 makes that concrete: the DAGs contain no transformation logic at all.
-They name an image, a schedule and some parameters. The SQL lives inside the
-image, baked in at build time, so the same artifact runs unchanged on ECS.
+Steps 4 and 6 make that concrete. The DAGs contain no transformation logic at
+all — they name an image, a schedule and some parameters. Nothing in them even
+says "Spark": the Spark job is an image like any other, which happens to run
+`spark-submit` in its own entrypoint. Moving to EMR Serverless is a change of
+operator rather than a rewrite.
 
 ### Everything must be portable
 
@@ -53,8 +56,8 @@ environment.
 | Warehouse | ClickHouse cluster | ClickHouse on the Pi cluster | ClickHouse Cloud |
 | Orchestration | Airflow + DockerOperator | same | MWAA + ECS tasks |
 | Object storage | MinIO | MinIO on local disks | S3 |
-| Jobs | container images | the same images | the same images |
 | Processing | Spark standalone | Spark standalone | EMR Serverless |
+| Jobs | container images | the same images | the same images |
 
 The job code is identical in all three columns. Only the operator in the DAG
 and a handful of environment variables change.
@@ -89,8 +92,8 @@ flowchart LR
     API --> K
     OLTP -- CDC --> K
     K --> CH
-    K --> SJ
     CH --> S3
+    S3 --> SJ
     SJ --> S3
     S3 --> PY
     PY --> CH
@@ -117,8 +120,8 @@ touches the data itself.
 | 03 | [DBMS](03-dbms/) | Postgres, Debezium change capture, ClickHouse cluster of 4 shards x 2 replicas with Keeper, deduplicating staging layer | done |
 | 04 | [ETL](04-etl/) | Airflow 3, DAGs that start job containers, a daily mart, a Parquet export to S3 | done |
 | 05 | [MinIO](05-minio/) | S3-compatible storage, three-layer bucket layout, versioning, lifecycle rules | done |
-| 06 | Spark | standalone master and workers, jobs reading Kafka and S3, writing Parquet | next |
-| 07 | dbt | models over everything accumulated: CDC staging and Spark output | planned |
+| 06 | [Spark](06-spark/) | standalone cluster of 4 workers, S3A with the committer that S3 actually supports, raw to staged | done |
+| 07 | dbt | models over everything accumulated: CDC staging and Spark output | next |
 | 08 | Superset | dashboards on top of the marts | planned |
 
 Ordered so that each step gets its input from the previous one. Monitoring is
@@ -142,7 +145,9 @@ and reason about once they do.
 leadership move and the ISR shrink. Kill a ClickHouse replica and watch writes
 keep succeeding on the survivor, then watch the returning node catch up. Stop
 the Airflow scheduler and watch the UI carry on looking perfectly healthy while
-nothing gets scheduled. Each stack README ends with drills of this kind.
+nothing gets scheduled. Kill a Spark worker mid-job and watch its tasks
+reschedule; kill the master and watch running jobs carry on regardless. Each
+stack README ends with drills of this kind.
 
 **Failures that leave everything green.** An exporter whose endpoint answers
 while exporting nothing usable. A Kafka consumer subscribed to a topic it will
@@ -150,15 +155,17 @@ never read. A `CREATE ... ON CLUSTER` that succeeds while every distributed
 query fails, because the two use different transports. A distributed JOIN that
 returns a plausible, wrong number because the join key is not the sharding key.
 A DAG that fails to import and is therefore absent rather than broken. A
-versioned bucket quietly keeping every overwrite for ever. An alerting rule
-naming a metric that does not exist, which never fires and never complains.
-These are what the smoke tests exist for.
+versioned bucket quietly keeping every overwrite for ever. A Spark job that
+writes `_SUCCESS` into an empty prefix because its committer staged the data
+somewhere the driver could not see. An alerting rule naming a metric that does
+not exist, which never fires and never complains. These are what the smoke
+tests exist for.
 
 **Correctness under change.** Deduplicating a stream of inserts, updates and
 deletes so readers see one current row. Why the version column must be a log
 position and not a timestamp. Why partitioning by a mutable column silently
-breaks deduplication forever. Why an idempotent job is worth more than a
-careful operator.
+breaks deduplication forever. Why overwriting one partition in S3 needs more
+care than it looks, and how a re-run of one day can delete a month.
 
 **Operational habits.** Pinned image versions, health checks that mean
 something, resource limits, credentials outside version control, one-command
@@ -169,11 +176,12 @@ teardown and rebuild from scratch.
 ## Getting started
 
 Each stack runs independently and pulls in what it needs through Compose
-`include`. Starting step 5 starts all five.
+`include`. Starting step 6 starts all six.
 
 ```bash
-cd 05-minio
+cd 06-spark
 cp .env.example .env
+cp ../05-minio/.env.example ../05-minio/.env
 cp ../04-etl/.env.example ../04-etl/.env
 cp ../03-dbms/.env.example ../03-dbms/.env
 cp ../02-monitoring/.env.example ../02-monitoring/.env
@@ -185,8 +193,9 @@ make test
 To start only the broker and its monitoring, do the same from `02-monitoring`.
 To run without the ClickHouse cluster on a smaller machine, `make up-light`.
 
-Memory is the binding constraint. The full platform wants roughly 24 GiB
-available to Docker; 48 is comfortable. Each stack README states its own needs.
+Memory is the binding constraint. The full platform with the Spark cluster
+wants 64 GiB available to Docker; without Spark, 24 is enough. Each stack
+README states its own needs.
 
 ---
 
@@ -204,7 +213,7 @@ bigdata-cluster-docker/
     ├── Makefile           up / down / logs / test / stack-specific helpers
     ├── scripts/smoke.sh   assertions about the running stack
     ├── dags/              scheduling only, no logic          (04-etl)
-    └── jobs/              the work, as versioned images      (04-etl)
+    └── jobs/              the work, as versioned images      (04-etl, 06-spark)
 ```
 
 ---
@@ -218,9 +227,9 @@ service name, never by IP address.
 **Nothing runs as `latest`.** Every image tag is pinned in `.env.example`, and
 pinned from the **registry** rather than from the project's source releases —
 the two are not always in step, and MinIO is the current example: its public
-images stop months behind its releases. Where a project publishes no maintained
-image, the Dockerfile takes the artifact from its GitHub release and verifies
-it.
+images stop months behind its releases. The same rule applies to jars: their
+versions are fixed by what they must match, not chosen, and the Spark image
+build opens each one to confirm the class it is supposed to contain.
 
 **Configuration through `.env`.** Secrets and machine-specific values stay out
 of the repository. Each stack ships a documented `.env.example`, and `make up`
@@ -232,11 +241,14 @@ through the Docker API: an exporter carries `prometheus.scrape`,
 container labels, and no stack has to edit the monitoring configuration to be
 seen.
 
+**Jobs are images, not code in the orchestrator.** `dags/` decides when and
+with what parameters; `jobs/` does the work. The two never mix, which is what
+keeps a job a versioned artifact that runs unchanged anywhere.
+
 **Comments explain the why.** Compose files are written for someone who knows
-what a container is but has not memorised Kafka listener semantics or
-ClickHouse deduplication rules. Where a setting exists to avoid a specific
-failure, the comment says which one — often with the exact error message it
-produces.
+what a container is but has not memorised Kafka listener semantics or S3A
+committer behaviour. Where a setting exists to avoid a specific failure, the
+comment says which one — often with the exact error message it produces.
 
 **A `Makefile` per stack.** Standard targets everywhere: `up`, `down`, `clean`,
 `ps`, `logs`, `config`, `smoke`, `test`. Run `make` on its own for the full
@@ -248,7 +260,7 @@ stack that a successful start does not prove. GitHub Actions runs both on every
 change, on a clean runner, from an empty state.
 
 Where CI cannot cover something, the stack README says so and gives the
-commands that do. Steps 3 to 5 are the current examples: eight ClickHouse nodes
+commands that do. Steps 3 to 6 are the current examples: eight ClickHouse nodes
 do not fit on a GitHub runner, so those workflows start everything else and the
 skipped assertions print as `SKIP` rather than quietly disappearing.
 
@@ -257,9 +269,9 @@ skipped assertions print as `SKIP` rather than quietly disappearing.
 ## Requirements
 
 Docker Engine 24 or newer with Compose v2. Memory is the binding constraint:
-Kafka alone wants roughly 8 GB available to Docker, and the full platform with
-the ClickHouse cluster wants 24 or more. On Docker Desktop this is under
-Settings → Resources.
+Kafka alone wants roughly 8 GB available to Docker, the platform through step 5
+wants 24, and adding the Spark cluster brings it to 64. On Docker Desktop this
+is under Settings → Resources.
 
 Images are multi-architecture, so the stacks run on both x86-64 and arm64
 (Apple Silicon, Raspberry Pi 5).
