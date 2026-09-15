@@ -1,9 +1,9 @@
 # ============================================================================
-#  PLATFORM — step 5: object storage (part 1 — MinIO itself)
+#  PLATFORM — step 5: object storage
 # ============================================================================
 #
-#  S3-compatible storage. Buckets and lifecycle rules come in part 2, the job
-#  that reads and writes through them in part 3.
+#  S3-compatible storage with a three-layer bucket layout, versioning where it
+#  buys something, and lifecycle rules that stop it costing money quietly.
 #
 #  Start:  make up
 #  UI:     http://localhost:9001
@@ -34,9 +34,14 @@ services:
   #  engineering one.
   #
   #  No exporter: MinIO serves Prometheus metrics itself, like ClickHouse.
+  #
+  #  The image comes from quay.io rather than Docker Hub. MinIO publishes
+  #  there now, the Hub copies stopped being updated, and some tags are
+  #  missing from them entirely — see the note in .env.example, which also
+  #  explains why that only breaks on a clean machine.
   # ==========================================================================
   minio:
-    image: minio/minio:${MINIO_VERSION}
+    image: ${MINIO_IMAGE}:${MINIO_VERSION}
     container_name: minio
     restart: unless-stopped
     networks: [dataplatform]
@@ -65,7 +70,8 @@ services:
 
     labels:
       # Discovered by docker-sd, like every exporter since step 2. The metrics
-      # path is not /metrics, so it is declared here too.
+      # path is not /metrics, so it is declared here too — and that label is
+      # why docker-sd in 02-monitoring has a rule for __metrics_path__.
       prometheus.scrape: "true"
       prometheus.port: "9000"
       prometheus.job: "minio"
@@ -91,7 +97,7 @@ services:
   #  fresh clone and `make up` produces the same buckets with the same rules.
   # ==========================================================================
   minio-init:
-    image: minio/mc:${MC_VERSION}
+    image: ${MC_IMAGE}:${MC_VERSION}
     container_name: minio-init
     restart: "no"
     networks: [dataplatform]

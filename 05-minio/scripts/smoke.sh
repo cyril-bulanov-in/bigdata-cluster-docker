@@ -31,6 +31,7 @@ API_PORT="$(read_env MINIO_API_PORT .env)";       API_PORT="${API_PORT:-9000}"
 MINIO_USER="$(read_env MINIO_ROOT_USER .env)";    MINIO_USER="${MINIO_USER:-minioadmin}"
 MINIO_PASS="$(read_env MINIO_ROOT_PASSWORD .env)"; MINIO_PASS="${MINIO_PASS:-minioadmin}"
 MC_VERSION="$(read_env MC_VERSION .env)";         MC_VERSION="${MC_VERSION:-latest}"
+MC_IMAGE="$(read_env MC_IMAGE .env)";   MC_IMAGE="${MC_IMAGE:-quay.io/minio/mc}"
 RAW="$(read_env BUCKET_RAW .env)";                RAW="${RAW:-raw}"
 STAGED="$(read_env BUCKET_STAGED .env)";          STAGED="${STAGED:-staged}"
 CURATED="$(read_env BUCKET_CURATED .env)";        CURATED="${CURATED:-curated}"
@@ -53,10 +54,15 @@ info() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 
 # The client as a throwaway container on the platform network, so it reaches
 # MinIO by service name exactly as a job would.
+#
+# The registry is a variable, not a literal. MinIO publishes to quay.io now
+# and the Docker Hub copies are missing tags — a literal here kept working
+# locally, where the image was already pulled, and failed in CI on a clean
+# machine.
 mc() {
   docker run --rm --network dataplatform \
     -e "MC_HOST_local=http://${MINIO_USER}:${MINIO_PASS}@minio:9000" \
-    "minio/mc:${MC_VERSION}" "$@" 2>/dev/null | tr -d '\r' || true
+    "${MC_IMAGE}:${MC_VERSION}" "$@" 2>/dev/null | tr -d '\r' || true
 }
 
 # ---------------------------------------------------------------------------

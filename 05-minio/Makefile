@@ -3,11 +3,12 @@
 # This stack includes 04-etl and everything below it, so `make up` here starts
 # the whole platform. Run every command from this directory.
 #
-#   make          - list the available commands
-#   make up       - start everything
-#   make up-light - start without the ClickHouse cluster
-#   make mc       - a shell with the MinIO client, configured
-#   make clean    - stop everything and wipe every volume in the project
+#   make            - list the available commands
+#   make up         - start everything
+#   make up-light   - start without the ClickHouse cluster
+#   make buckets    - the layout, with versioning and lifecycle
+#   make mc         - a shell with the MinIO client, configured
+#   make clean      - stop everything and wipe every volume in the project
 
 PROFILES ?= --profile clickhouse
 COMPOSE := docker compose $(PROFILES)
@@ -24,6 +25,7 @@ API_PORT     := $(or $(call getenv,MINIO_API_PORT,$(ENV)),9000)
 CONSOLE_PORT := $(or $(call getenv,MINIO_CONSOLE_PORT,$(ENV)),9001)
 MINIO_USER   := $(or $(call getenv,MINIO_ROOT_USER,$(ENV)),minioadmin)
 MINIO_PASS   := $(or $(call getenv,MINIO_ROOT_PASSWORD,$(ENV)),minioadmin)
+MC_IMAGE     := $(or $(call getenv,MC_IMAGE,$(ENV)),quay.io/minio/mc)
 MC_VERSION   := $(or $(call getenv,MC_VERSION,$(ENV)),latest)
 PROM_PORT    := $(or $(call getenv,PROMETHEUS_PORT,$(MON_ENV)),9090)
 
@@ -33,7 +35,7 @@ PROM := http://localhost:$(PROM_PORT)
 # reaches MinIO by service name exactly as a job would.
 MC := docker run --rm --network dataplatform \
         -e MC_HOST_local=http://$(MINIO_USER):$(MINIO_PASS)@minio:9000 \
-        minio/mc:$(MC_VERSION)
+        $(MC_IMAGE):$(MC_VERSION)
 
 .DEFAULT_GOAL := help
 .PHONY: help check-env up up-light down restart clean ps logs config urls \
@@ -77,6 +79,16 @@ urls: ## print the web interfaces
 	@echo "  Prometheus     $(PROM)"
 	@echo ""
 
+# --- checks -----------------------------------------------------------------
+
+config: check-env ## validate the compose file and the includes
+	@$(COMPOSE) config -q && echo "compose file is valid, all variables resolved"
+
+smoke: ## assert the whole stack actually works
+	@./scripts/smoke.sh
+
+test: config smoke ## validate the configuration, then the running stack
+
 # --- MinIO ------------------------------------------------------------------
 
 minio-status: ## is MinIO up and answering
@@ -114,7 +126,7 @@ objects: ## everything stored, recursively (BUCKET=raw to narrow)
 mc: ## interactive shell with the MinIO client, already configured
 	@docker run --rm -it --network dataplatform \
 	  -e MC_HOST_local=http://$(MINIO_USER):$(MINIO_PASS)@minio:9000 \
-	  --entrypoint sh minio/mc:$(MC_VERSION)
+	  --entrypoint sh $(MC_IMAGE):$(MC_VERSION)
 
 minio-metrics: ## is Prometheus scraping MinIO
 	@printf 'minio targets discovered (expect 1): '
@@ -132,11 +144,3 @@ ps: ## container status
 
 logs: ## follow every service
 	$(COMPOSE) logs -f
-
-smoke: ## assert the whole stack actually works
-	@./scripts/smoke.sh
-
-test: config smoke ## validate the configuration, then the running stack
-
-config: check-env ## validate the compose file and the includes
-	@$(COMPOSE) config -q && echo "compose file is valid, all variables resolved"
