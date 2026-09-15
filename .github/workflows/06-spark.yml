@@ -49,6 +49,33 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # ----------------------------------------------------------------------
+      #  Docker Hub, and why this is not optional for this workflow
+      # ----------------------------------------------------------------------
+      #  Anonymous pulls are limited to 100 per six hours per IP, and runner
+      #  IPs are shared. This stack includes five others and pulls around
+      #  twenty-five images, so it hits the ceiling where the smaller
+      #  workflows do not.
+      #
+      #  The message is misleading. A rate limit surfaces as
+      #
+      #      pull access denied for minio/minio, repository does not exist
+      #      or may require 'docker login'
+      #
+      #  which reads like a typo in an image name that is plainly correct, and
+      #  it lands on a different image each attempt — whichever one happened
+      #  to be next.
+      #
+      #  Skipped when the secrets are absent, so a fork still runs and simply
+      #  takes its chances with the anonymous limit.
+      # ----------------------------------------------------------------------
+      - name: Log in to Docker Hub
+        if: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Show Docker versions and memory
         run: |
           docker compose version
