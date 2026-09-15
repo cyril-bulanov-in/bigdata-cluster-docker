@@ -5,6 +5,7 @@
 # The transformation itself needs data in s3://raw/, which is produced by a
 # job that reads ClickHouse — absent here. That check prints as SKIP; see
 # "What continuous integration does not cover" in 06-spark/README.md.
+# comment to skip....
 
 name: 06-spark
 
