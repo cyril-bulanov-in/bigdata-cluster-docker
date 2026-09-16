@@ -1,0 +1,72 @@
+# ============================================================================
+#  Where the data comes from
+# ============================================================================
+#  Declaring sources rather than writing table names into models buys three
+#  things: `dbt source freshness` can check them, the lineage graph shows
+#  where a model's input comes from, and a schema change is one edit here
+#  instead of a search across every model.
+#
+#  The database name is an environment variable, so the same project runs
+#  against a differently named warehouse without touching the models.
+# ============================================================================
+
+version: 2
+
+sources:
+  - name: cdc
+    description: >
+      The staging layer built by change capture in 03-dbms. Postgres writes to
+      its write-ahead log, Debezium streams it into Kafka, and ClickHouse's
+      Kafka engine writes it here through materialized views.
+    database: "{{ env_var('SOURCE_DATABASE', 'analytics') }}"
+    schema: "{{ env_var('SOURCE_DATABASE', 'analytics') }}"
+
+    # ------------------------------------------------------------------------
+    #  Freshness
+    # ------------------------------------------------------------------------
+    #  The one check that catches a stopped pipeline. When capture breaks
+    #  nothing errors: the topics stop receiving messages, which looks exactly
+    #  like an idle database, and every model downstream keeps building
+    #  happily from data that stopped moving hours ago.
+    #
+    #  Measured on source_ts — the timestamp Debezium took from the database,
+    #  not the time the row arrived here. The difference matters: ingested_at
+    #  would stay fresh even if capture were replaying a week-old backlog.
+    # ------------------------------------------------------------------------
+    freshness:
+      warn_after: {count: 30, period: minute}
+      error_after: {count: 2, period: hour}
+    loaded_at_field: source_ts
+
+    tables:
+      - name: orders
+        description: >
+          One row per version of an order. The generator writes each order at
+          least twice — an insert, then an update setting the total — and again
+          on every status change, so several rows per order_id is normal here
+          and is what FINAL collapses downstream.
+        columns:
+          - name: order_id
+            description: Primary key in the source database.
+          - name: source_lsn
+            description: >
+              Write-ahead log position, the version column for deduplication.
+              Monotonic per database and produced by Postgres itself, which is
+              why it is used rather than updated_at.
+          - name: is_deleted
+            description: 1 for a delete event. The row is kept as a tombstone.
+
+      - name: order_items
+        description: >
+          Lines of an order. Insert-only in practice, and sharded on order_id
+          rather than its own key so the lines sit on the same node as their
+          order.
+
+      - name: customers
+        description: >
+          The table deletes happen on. A delete event carries every column
+          because REPLICA IDENTITY FULL is set on the source — without it there
+          would be a customer_id and nothing else.
+
+      - name: products
+        description: A small dimension, updated in place.

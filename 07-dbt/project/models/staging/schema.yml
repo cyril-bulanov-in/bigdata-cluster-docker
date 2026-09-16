@@ -1,0 +1,144 @@
+# ============================================================================
+#  What must be true of the staging models
+# ============================================================================
+#  These run on `dbt test` and, more usefully, on `dbt build` — where a failing
+#  test stops the models that depend on it rather than letting a bad number
+#  propagate into a mart and out to a dashboard.
+#
+#  The tests here are deliberately about structure rather than business rules:
+#  keys are unique, required columns are present, references resolve. A
+#  staging model that fails one of these is broken in a way no downstream
+#  logic can compensate for.
+# ============================================================================
+
+version: 2
+
+models:
+
+  - name: stg_orders
+    description: >
+      One current row per order, versions collapsed and deletes removed.
+    columns:
+      - name: order_id
+        description: Primary key.
+        data_tests:
+          # The single most valuable test in the project. FINAL is what makes
+          # this pass; remove it from the model and this fails immediately
+          # with the number of surplus versions, rather than the mart quietly
+          # counting each status change as another order.
+          - unique
+          - not_null
+
+      - name: customer_id
+        description: The customer who placed it.
+        data_tests:
+          - not_null
+          # Orders whose customer has been deleted are a real possibility:
+          # capture carries the delete, and the order outlives it. Warn rather
+          # than error, because that is a fact about the data and not a defect
+          # in this model.
+          - relationships:
+              to: ref('stg_customers')
+              field: customer_id
+              config:
+                severity: warn
+
+      - name: status
+        description: Where the order is in its lifecycle.
+        data_tests:
+          - not_null
+          - accepted_values:
+              # Written out rather than left open so that a new status added
+              # upstream shows up here as a failing test instead of appearing
+              # unannounced in a dashboard.
+              values: ['pending', 'paid', 'shipped', 'delivered', 'cancelled']
+
+      - name: total_amount
+        description: Order total, as a Decimal carried unchanged from Postgres.
+        data_tests:
+          - not_null
+
+      - name: order_date
+        data_tests:
+          - not_null
+
+  - name: stg_order_items
+    description: One current row per order line.
+    columns:
+      - name: order_item_id
+        data_tests:
+          - unique
+          - not_null
+
+      - name: order_id
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('stg_orders')
+              field: order_id
+              config:
+                # Also a warning, and for a subtler reason than above: an item
+                # can arrive before its order. Both come through Kafka on
+                # different topics with no ordering between them, so a line
+                # briefly without a parent is the pipeline working normally.
+                # An error here would fire on timing rather than on damage.
+                severity: warn
+
+      - name: product_id
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('stg_products')
+              field: product_id
+              config:
+                severity: warn
+
+      - name: quantity
+        data_tests:
+          - not_null
+
+      - name: line_total
+        description: quantity times the price paid, not the current price.
+        data_tests:
+          - not_null
+
+  - name: stg_customers
+    description: One current row per customer, deleted ones excluded.
+    columns:
+      - name: customer_id
+        data_tests:
+          - unique
+          - not_null
+
+      - name: email
+        data_tests:
+          - not_null
+          # Unique in the source, and worth asserting here because a duplicate
+          # would mean FINAL failed to collapse two versions — the same class
+          # of failure as a non-unique key, caught from a different angle.
+          - unique
+
+      - name: country_code
+        data_tests:
+          - not_null
+
+  - name: stg_products
+    description: One current row per product.
+    columns:
+      - name: product_id
+        data_tests:
+          - unique
+          - not_null
+
+      - name: sku
+        data_tests:
+          - unique
+          - not_null
+
+      - name: category
+        data_tests:
+          - not_null
+
+      - name: current_price
+        data_tests:
+          - not_null

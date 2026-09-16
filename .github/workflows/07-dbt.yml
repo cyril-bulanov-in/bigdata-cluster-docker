@@ -1,0 +1,88 @@
+# Builds the dbt image and parses the project, without a database.
+#
+# Deliberately narrower than the other workflows, and the reason is structural
+# rather than a shortcut: dbt does nothing without a warehouse, and eight
+# ClickHouse nodes do not fit on a GitHub runner. Starting the whole platform
+# here would burn twenty minutes to reach the same checks this reaches in two.
+#
+# What that still catches is most of what breaks when someone edits SQL — see
+# "What continuous integration does not cover" in 07-dbt/README.md.
+
+name: 07-dbt
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '07-dbt/**'
+      - '.github/workflows/07-dbt.yml'
+  pull_request:
+    paths:
+      - '07-dbt/**'
+      - '.github/workflows/07-dbt.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: 07-dbt-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    # Minutes, not tens of minutes: nothing is started, only built and parsed.
+    timeout-minutes: 15
+
+    defaults:
+      run:
+        working-directory: 07-dbt
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # Anonymous pulls from Docker Hub are limited per IP and runner IPs are
+      # shared. Only one image is pulled here, so this matters less than in
+      # the other workflows, but the failure it prevents is the same confusing
+      # "repository does not exist" on a name that is plainly correct.
+      - name: Log in to Docker Hub
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        if: env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Only this stack's own .env is needed. The others are not read, because
+      # nothing from the lower stacks is started.
+      - name: Prepare .env
+        run: cp .env.example .env
+
+      - name: Build the dbt image
+        run: make dbt-build
+
+      # The whole point of this workflow. dbt resolves every ref() and
+      # source(), compiles the Jinja and builds the dependency graph — with no
+      # database and, here, no network at all, which proves the check does not
+      # quietly depend on one.
+      #
+      # It catches a ref() to a renamed model, a source missing from
+      # sources.yml, unbalanced Jinja, and a test naming a column that no
+      # longer exists. It does not catch SQL that is valid to dbt and wrong to
+      # ClickHouse — that needs the warehouse.
+      - name: Smoke test, parsing only
+        run: make smoke
+
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== images ==="
+          docker images --filter 'reference=dataplatform/dbt' || true
+          echo ""
+          echo "=== dbt version ==="
+          docker run --rm --network none dataplatform/dbt:$(grep -E '^DBT_VERSION=' .env | cut -d= -f2) --version || true
+          echo ""
+          echo "=== parse, in full ==="
+          docker run --rm --network none dataplatform/dbt:$(grep -E '^DBT_VERSION=' .env | cut -d= -f2) parse || true
+          echo ""
+          echo "=== the project as dbt sees it ==="
+          docker run --rm --network none dataplatform/dbt:$(grep -E '^DBT_VERSION=' .env | cut -d= -f2) ls || true
