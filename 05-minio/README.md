@@ -1,223 +1,210 @@
-# 05-minio — object storage
+# 02-monitoring — Prometheus, Grafana and exporters
 
-S3-compatible storage with a three-layer bucket layout, versioning where it
-buys something, and lifecycle rules that stop it from costing money quietly.
+Metrics for everything the platform runs: the Kafka cluster's own internals,
+consumer lag, the host machine, and every container separately. Prometheus
+collects and evaluates alerting rules, Grafana draws, four kinds of exporter
+translate.
 
-Step 5 of [bigdata-cluster-docker](../README.md). It **includes** `04-etl` and
-everything below it, so `make up` here starts the whole platform.
+Step 2 of [bigdata-cluster-docker](../README.md). It **includes** step 1, so
+`make up` here starts Kafka as well — you do not need to start `01-kafka`
+separately.
 
 ## Quick start
 
 ```bash
 cp .env.example .env
-cp ../04-etl/.env.example ../04-etl/.env          # if not already there
-cp ../03-dbms/.env.example ../03-dbms/.env
-cp ../02-monitoring/.env.example ../02-monitoring/.env
-cp ../01-kafka/.env.example ../01-kafka/.env
-chmod +x scripts/smoke.sh minio/init.sh
-
+cp ../01-kafka/.env.example ../01-kafka/.env   # if you have not already
 make up
-make test
 ```
+
+The first start builds two images and pulls five, so give it a few minutes.
 
 | | |
 |---|---|
-| MinIO console | http://localhost:9001 (credentials in `.env`) |
-| MinIO S3 API | http://localhost:9000 |
-| Airflow | http://localhost:8081 |
-| ClickHouse | http://localhost:8123/play |
-| Grafana | http://localhost:3000 |
+| Grafana | http://localhost:3000 (login in `.env`) |
+| Dashboard | http://localhost:3000/d/platform-overview |
+| Prometheus | http://localhost:9090 |
+| Alerts | http://localhost:9090/alerts |
+| cAdvisor | http://localhost:8082 |
+| Kafbat UI | http://localhost:8080 |
 
-`make up-light` starts everything except the ClickHouse cluster.
+The **Platform overview** dashboard is already there, connected and populated.
+Nothing to import.
 
-Port 9000 is free because ClickHouse's native port was deliberately published
-on 9010 back in step 3, for exactly this.
-
-## Why this comes before Spark
-
-Spark without object storage either reads Kafka straight into ClickHouse —
-which ClickHouse already does by itself — or works on local files, which has
-nothing to do with the target architecture. With MinIO in place the jobs have
-a real task: read from Kafka or S3, write Parquet back, through the same
-`s3a://` paths that will point at AWS with one variable changed.
-
-## The layout
-
-Three layers, three buckets.
-
-| Bucket | Contents | Versioning | Lifecycle |
-|---|---|---|---|
-| `raw` | exactly what arrived, never edited | on | expire after 30d, noncurrent after 7d |
-| `staged` | parsed, typed, deduplicated | on | noncurrent after 7d |
-| `curated` | modelled for the queries that run | off | none |
-
-Separate buckets rather than prefixes in one, because lifecycle rules and
-access policies are set per bucket — a retention rule on `raw` then cannot
-reach `curated` by accident.
-
-Created by `minio-init`, a container that runs to completion and exits. It is
-idempotent, so `make up` calls it every time without a guard, and a fresh
-clone produces the same layout with the same rules.
-
-### Versioning is on for two buckets and off for one
-
-`raw` and `staged` are written by jobs that can be re-run. A re-run that
-overwrites an object destroys the evidence of what the first run produced.
-With versioning the previous copy is still there.
-
-`curated` is derived and rebuildable from `staged`, so keeping every version
-of it costs storage for no recovery value.
-
-The smoke test asserts all three, including that `curated` is **off** — that
-one exists to catch versioning being switched on everywhere "to be safe".
-
-### The lifecycle rule that pays for itself
-
-`--noncurrent-expire-days 7` on the versioned buckets.
-
-Without it, versioning accumulates every overwrite for ever. This is the most
-common way an object storage bill grows with no visible cause: the console
-lists current versions only, so the object count and the total size both look
-correct while the storage underneath keeps growing.
-
-Checking it by hand means comparing the object count against the version
-count, which nobody does. So it is a smoke check and an alert instead —
-`MinioMissedFreeVersions` in
-`../02-monitoring/prometheus/rules/05-minio.yml` watches MinIO's own expiry
-counters, which say whether the rules are being applied rather than whether
-their effect happens to be visible yet.
-
-## There are no directories in S3
-
-Worth stating because the console shows a folder tree and it is a fiction.
-
-There are only object names, and a slash is an ordinary character in one. The
-console groups by prefix for display. `make objects` lists recursively, which
-is what is actually stored:
+Then check that it is really collecting, rather than merely running:
 
 ```bash
-make objects BUCKET=raw
+make test
 ```
 
-A "folder" created through the console appears as a zero-byte object whose
-name ends in a slash — MinIO writes that placeholder so the UI has something
-to show. Real S3 has no such object.
+## What is inside
 
-The consequence that matters: **there is no rename**. `mc mv` and `aws s3 mv`
-are wrappers around CopyObject plus DeleteObject. Renaming a prefix means
-copying and deleting every object under it — one request pair each, no
-atomicity, and CopyObject caps at 5 GB per object before multipart copy is
-required.
+| Container | What it produces | Port |
+|---|---|---|
+| `prometheus` | collects, stores, evaluates alerting rules | 9090 |
+| `grafana` | dashboards, provisioned from files | 3000 |
+| `jmx-kafka-1..4` | Kafka internals over JMX, one per broker | 5556 |
+| `kafka-lag-exporter` | consumer lag, topic and partition counts | 9308 |
+| `node-exporter` | host CPU, memory, disks, network | 9100 |
+| `cadvisor` | per-container CPU, memory, limits, throttling | 8080 |
 
-Which is why the prefix layout is decided up front and never touched:
+Only Prometheus, Grafana and cAdvisor publish a port to the host. The exporters
+are reachable inside the `dataplatform` network and nowhere else, which is how
+it should be — none of them has authentication.
 
-```
-raw/orders/dt=2026-09-06/orders.parquet
-    ^      ^             ^
-    |      |             the only part that ever grows
-    |      never changes
-    the layer, which is the bucket
-```
+## Why these exporters
 
-`dt=` is Hive-style partitioning, and not decoration: Spark, Trino and Athena
-read it as a partition column and skip prefixes that cannot match a filter,
-without listing them.
+**JMX exporters** cover Kafka's own view of itself: replication state,
+throughput, controller elections, JVM heap. Kafka publishes these over JMX,
+which Prometheus cannot read, so one exporter per broker sits in between. One
+per broker because a JMX connection targets a single JVM.
 
-## Writing through the protocol
+**kafka-lag-exporter** speaks the Kafka protocol instead and answers the one
+question JMX cannot: how far behind each consumer group is. A broker can be
+perfectly healthy while a consumer falls hours behind.
 
-The export job in `04-etl` reads a day of orders from ClickHouse and writes it
-as Parquet:
+**node-exporter** answers "how loaded is the machine". **cAdvisor** answers
+"which container is doing it", which is usually the question you actually have.
+cAdvisor also exposes each container's memory *limit* and CPU throttling, and
+those two earn its place: without them an OOM kill looks like a random restart,
+and a container capped at half a core looks merely slow rather than
+deliberately paused by the kernel.
 
-```bash
-cd ../04-etl
-make export-job DAY=2026-09-06 DRY_RUN=1    # read and report, write nothing
-make export-job DAY=2026-09-06
-cd ../05-minio && make objects BUCKET=raw
-```
+## Alerting
 
-Two things in that job are worth reading rather than described here: the two
-boto3 settings that make an S3 client work against MinIO, and the read-back
-verification. See `../04-etl/jobs/export-orders/run.py`.
+Twelve rules in `prometheus/rules/alerts.yml`, in four groups: targets, Kafka,
+host, containers.
 
-Run it twice on the same day and the object count stays at one while the
-version id changes:
+`TargetDown` is the most valuable one. It catches failures nobody anticipated,
+because it does not care what broke — only that something stopped answering.
 
-```bash
-make mc
-mc ls --versions local/raw/orders/dt=2026-09-06/
-```
+Every rule has a `for:` clause. That is the part people skip, and it is what
+separates an alert from a noise generator: the condition has to hold for that
+long before the alert fires, so a two-second blip during a rebalance stays
+quiet. A controller election takes seconds, hence two minutes on the controller
+rule; a busy minute during compaction is normal, hence ten on host CPU.
 
-That is versioning doing its job: the earlier result is still recoverable, and
-the lifecycle rule removes it after a week.
-
-## Traps from this step
-
-**A Docker Hub tag is not a GitHub release tag.** MinIO's public images stop
-around September 2025 while the source keeps releasing. A version copied from
-the releases page fails with `failed to resolve reference ... not found`.
-Check before committing one:
-
-```bash
-docker manifest inspect minio/minio:<tag> >/dev/null && echo ok
-```
-
-**MinIO serves metrics on `/minio/v2/metrics/cluster`, not `/metrics`.** The
-container carries a `prometheus.path` label and `docker-sd` in
-`02-monitoring` has a relabel rule for `__metrics_path__`. Without it the
-target is discovered and scrapes a 404 — red for a reason that has nothing to
-do with MinIO.
-
-**Replacing a mounted file needs `--force-recreate`; replacing a file inside a
-mounted directory does not.** A bind mount of a single file follows the inode,
-and most editors replace rather than rewrite. The container then holds a
-reference to a file that no longer exists and reports `no such file or
-directory` for a path that is plainly there on the host.
-
-**Two of the six metric names in the first draft of the alerting rules did not
-exist.** Invented by analogy: `minio_bucket_usage_version_total` looked
-reasonable and is not a thing. A rule naming a metric that does not exist
-never fires and never complains. The smoke test now asserts that every metric
-the rules depend on is present, so an upgrade that renames one turns the test
-red instead of silently disabling an alert.
-
-## What continuous integration does not cover
-
-The workflow starts everything except the ClickHouse cluster, for the same
-memory reason as steps 3 and 4.
-
-What that costs here is the export job, which reads from ClickHouse. So the
-smoke test has its own protocol check that depends on nothing but MinIO: write
-an object, read it back, compare the bytes, confirm a version was recorded,
-delete it. Without that, CI would verify that buckets exist and never once
-confirm that anything can be stored in them.
-
-CI covers: the compose files and every include, MinIO starting, the bucket
-layout, versioning on all three buckets, both lifecycle rules, Prometheus
-scraping the right path, every metric the alerting rules name, and a full
-write-read-verify round trip.
-
-**Locally, on a machine that can hold the cluster:**
-
-```bash
-make up
-make test          # 29 checks, nothing skipped
-cd ../04-etl && make export-job DAY=<a day with orders>
-cd ../05-minio && make objects BUCKET=raw
-```
+There is no Alertmanager. Rules are evaluated and firing alerts show up in
+`make alerts` and in the Prometheus UI, but there is nowhere to send them.
+That is a deliberate gap: routing to email or Slack is its own container and
+its own concern.
 
 ## Commands
 
 ```
-make help          list every command
-make up            start the whole platform including MinIO
-make up-light      start without the ClickHouse cluster
-make test          validate configs, then the running stack
-make clean         stop everything and wipe every volume
-
-make buckets       the layout, with versioning and lifecycle
-make buckets-init  re-run the layout script (idempotent)
-make objects       everything stored, recursively (BUCKET=raw)
-make mc            interactive shell with the MinIO client
-make minio-status  is it up and what does it report
-make minio-metrics is Prometheus scraping it
+make help        list every command
+make up          start Kafka, the exporters, Prometheus and Grafana
+make down        stop, keep the data
+make clean       stop and wipe all volumes, Kafka data included
+make config      validate compose, prometheus.yml, the rules, the dashboard
+make smoke       assert the running stack is really collecting
+make test        config, then smoke
+make targets     which scrape targets are up
+make rules       every alerting rule and its state
+make alerts      what is pending or firing right now
+make kafka-metrics / host-metrics / container-metrics / lag
+make datasource  did Grafana pick up the connection
+make dashboards  which dashboards Grafana loaded
+make reload      re-read prometheus.yml and rules, no restart
+make drill-down  run the failure drill below
+make drill-up    undo it
 ```
+
+## Failure drill
+
+Monitoring that has never seen a failure is decoration. This takes two minutes
+and exercises the whole chain: broker, exporter, scrape, rule, dashboard.
+
+```bash
+make drill-down          # stops kafka-2
+```
+
+Then watch it land, in this order:
+
+1. **~30 seconds** — `make targets` shows `jmx-kafka-2` down. The exporter is
+   alive; it is the JMX connection behind it that failed.
+2. **~1 minute** — `make alerts` shows `TargetDown` firing.
+3. **~2 minutes** — `KafkaUnderReplicatedPartitions` joins it. Partitions that
+   had a replica on `kafka-2` are now short one.
+4. **Grafana** — "Brokers up" drops to 3, "Under-replicated partitions" turns
+   red, one series disappears from the throughput graph.
+5. **`KafkaControllerCountWrong` stays quiet.** `kafka-2` is one of the three
+   controllers, so the quorum re-elected around it within seconds and the count
+   is still exactly 1. That is the interesting result: a controller died and
+   the cluster did not notice.
+
+```bash
+make drill-up            # starts kafka-2 again
+```
+
+Alerts clear once the replicas catch up, another minute or two.
+
+For contrast, run the same drill against `kafka-4`. It is a broker only, so the
+quorum is not involved at all and only the replication metrics move.
+
+## Configuration notes
+
+**`include`, not a copy.** This stack pulls in `../01-kafka/docker-compose.yml`
+rather than redefining Kafka. Both files declare `name: platform`, so it is the
+same Compose project: if Kafka is already running from `01-kafka`, `make up`
+here leaves it alone and adds only the monitoring containers. The consequence
+to know: `make clean` here removes the Kafka volumes too.
+
+**The network is not redeclared.** `dataplatform` is defined in `01-kafka` and
+arrives through `include`. Declaring it again — even identically — makes
+Compose report a resource name conflict, because `include` copies definitions
+rather than merging them.
+
+**Two images are built, not pulled.** Neither the JMX exporter nor cAdvisor has
+a maintained official container: the JMX exporter has never had one, and
+cAdvisor's registry stopped receiving new tags. Both projects publish the
+artifact itself on every GitHub release, so both Dockerfiles take that and put
+it on a minimal base. The jar is verified against its published sha256;
+cAdvisor publishes no checksum, so the build runs the binary instead.
+
+**cAdvisor needs the containerd socket, not just the Docker one.** Docker has
+run containers through containerd for years, and modern cAdvisor asks
+containerd for them. Without `/run/containerd/containerd.sock` its docker
+factory fails to register, and the symptom is not an error: the endpoint
+answers, the target is green, hundreds of `container_*` metrics are exported —
+and every one of them is the root cgroup. Any query filtering on `name!=""`
+comes back empty.
+
+**The Docker socket is owned by a different group on every host.** Prometheus
+reads it through `group_add` rather than running as root, and the group id is
+not a constant: on Docker Desktop the socket inside the VM is `root:root`, so
+group 0 works, while on a Linux host or a CI runner it is `root:docker` with a
+gid around 999, where group 0 grants nothing.
+
+The failure is silent and looks like the opposite of what it is. Service
+discovery finds zero containers, every label-based target never appears, and
+the static jobs keep working — so Prometheus is up, the dashboard has data, and
+monitoring is half blind. Nothing logs an error, and `make targets` shows a
+healthy list of exactly the targets that were never discovered in the first
+place.
+
+`DOCKER_GID` in `.env` is therefore read from the socket rather than assumed,
+and every CI workflow sets it before starting anything:
+
+```bash
+sed -i "s/^DOCKER_GID=.*/DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)/" .env
+```
+
+**The Grafana admin password applies only once.** `GRAFANA_ADMIN_PASSWORD` is
+used when the account is created, on the first start with an empty
+`grafana-data` volume. Editing `.env` afterwards changes nothing, because the
+password then lives in Grafana's own database. To change it:
+
+```bash
+docker compose exec grafana grafana cli admin reset-admin-password '<new>'
+```
+
+**Provisioning over clicking.** The datasource and the dashboard are files
+under `grafana/provisioning`, loaded on startup. A dashboard that exists only
+in someone's browser is not part of the project and does not survive
+`make clean`. If you improve one in the UI, export its JSON model and paste it
+back into the file.
+
+**`make reload` instead of a restart.** Prometheus runs with
+`--web.enable-lifecycle`, so a config or rules change is one POST away. A
+restart works too but throws away the in-memory block of recent data.
