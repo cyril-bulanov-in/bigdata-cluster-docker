@@ -5,7 +5,7 @@
 # ---------------------------------------------------------------------------
 
 # Real environment values — never committed. Each stack ships a .env.example.
-.env
+#.env
 .env.local
 *.env.bak
 
