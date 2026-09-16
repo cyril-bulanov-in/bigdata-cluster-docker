@@ -112,7 +112,16 @@ urls: ## print the web interfaces
 
 # --- dbt --------------------------------------------------------------------
 
-dbt-build: check-env ## build the dbt image
+# Deliberately NOT dependent on check-env.
+#
+# check-env requires the .env of every stack below, because `make up` starts
+# the whole platform. Building an image needs none of that — it reads the
+# Dockerfile and the project directory and nothing else.
+#
+# The distinction is not academic: the CI workflow builds and parses without
+# starting anything, and hanging check-env here made it demand six .env files
+# for stacks it never touches.
+dbt-build: ## build the dbt image
 	@printf 'building %s ... ' "$(DBT_IMAGE)"
 	@docker build -q -t $(DBT_IMAGE) -f dbt/Dockerfile . >/dev/null \
 	  && echo "ok" || { echo "FAILED"; exit 1; }
