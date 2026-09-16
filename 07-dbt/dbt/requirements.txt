@@ -1,0 +1,10 @@
+# Only the adapter is pinned, and dbt-core is deliberately absent.
+#
+# dbt-clickhouse 1.10.3 requires dbt-adapters<1.25, while the newest dbt-core
+# pulls a later one. Pinning both by hand means picking a pair and rechecking
+# it on every upgrade; pinning the adapter lets pip resolve a core that
+# actually satisfies it.
+#
+# The version that ends up installed is printed by `make dbt-version`, so it
+# is knowable without reading the build log.
+dbt-clickhouse==1.10.3

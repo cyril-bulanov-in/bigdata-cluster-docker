@@ -1,0 +1,56 @@
+# ============================================================================
+#  How dbt reaches ClickHouse
+# ============================================================================
+#  Every value comes from the environment. Nothing here is a secret, and
+#  nothing here changes when the same image runs against ClickHouse Cloud —
+#  only the variables do.
+#
+#  env_var takes a default as its second argument. The defaults match this
+#  platform, so `dbt debug` works with no environment set at all; a deployment
+#  that sets them properly is unaffected.
+# ============================================================================
+
+bigdata_platform:
+  target: "{{ env_var('DBT_TARGET', 'dev') }}"
+
+  outputs:
+    dev:
+      type: clickhouse
+
+      # The native protocol, not HTTP. dbt issues many small statements during
+      # a run, and the native protocol's lower per-query overhead shows.
+      driver: native
+      host: "{{ env_var('CLICKHOUSE_HOST', 'clickhouse-01') }}"
+      port: "{{ env_var('CLICKHOUSE_PORT', '9000') | int }}"
+      user: "{{ env_var('CLICKHOUSE_USER', 'default') }}"
+      password: "{{ env_var('CLICKHOUSE_PASSWORD', '') }}"
+
+      # Where dbt writes. A database of its own rather than `analytics`, which
+      # holds the CDC staging tables: a model named like a source table would
+      # otherwise be able to overwrite it, and `dbt run` is not the command you
+      # want capable of that.
+      schema: "{{ env_var('DBT_SCHEMA', 'marts') }}"
+
+      # ---- cluster settings -------------------------------------------------
+      # Deliberately NOT set: cluster, and therefore no ON CLUSTER on the DDL
+      # dbt generates.
+      #
+      # The warehouse is four shards with two replicas, and dbt-clickhouse can
+      # target that — but distributed materialisations are the fragile part of
+      # this adapter, in the same way the S3 committer was the fragile part of
+      # Spark. Marts here are small: one row per day and category, not per
+      # order. A single-node table is correct for that and stays legible.
+      #
+      # When a model genuinely needs to be distributed, it gets the setting
+      # explicitly in its own config rather than the whole project inheriting
+      # a mode it mostly does not want.
+
+      # Fail rather than hang. A model that takes five minutes on this data has
+      # gone wrong, and waiting for the default is waiting for nothing.
+      connect_timeout: 10
+      send_receive_timeout: 300
+
+      # One connection per thread; four threads because the cluster is four
+      # shards and the models are small. Raising it makes runs no faster and
+      # the failure output much harder to read.
+      threads: 4

@@ -1,0 +1,20 @@
+# ============================================================================
+#  PLATFORM — step 7: dbt (part 1 — the project and the connection)
+# ============================================================================
+#
+#  This stack adds no long-running services, and that is the point rather than
+#  an omission. dbt is a job: Airflow runs `dbt build`, the container exits.
+#  Declaring it as a service in compose would invite exactly the confusion
+#  this repository is built to avoid.
+#
+#  The file exists so that `make up` from here starts the whole platform
+#  underneath — and so a later part can add the one thing that IS a service,
+#  the documentation site.
+#
+#  Start:  make up          the platform
+#          make dbt-debug   does dbt reach ClickHouse
+# ============================================================================
+include:
+  - ../06-spark/docker-compose.yml
+
+name: platform

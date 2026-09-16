@@ -1,0 +1,56 @@
+# ============================================================================
+#  The dbt project
+# ============================================================================
+name: bigdata_platform
+version: "0.1.0"
+config-version: 2
+
+# Matches the profile name in profiles.yml. A mismatch fails with "Could not
+# find profile named ...", which is clear, but only if you know the two are
+# supposed to be the same string.
+profile: bigdata_platform
+
+model-paths: ["models"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+seed-paths: ["seeds"]
+snapshot-paths: ["snapshots"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+# ----------------------------------------------------------------------------
+#  Model defaults
+# ----------------------------------------------------------------------------
+#  Set per directory rather than per model, so a new model inherits the right
+#  behaviour instead of needing to remember it.
+#
+#  The layers mirror the object storage layout in 05-minio and mean the same
+#  things:
+#
+#    staging   one model per source, typed and deduplicated, no business logic
+#    marts     modelled for the queries that actually run
+#
+#  There is no `raw` here because raw lives in object storage, not in the
+#  warehouse.
+# ----------------------------------------------------------------------------
+models:
+  bigdata_platform:
+    staging:
+      # Views, not tables. A staging model is a rename, a cast and a filter
+      # over something already stored — materialising it would double the
+      # storage to save a query that ClickHouse does quickly anyway.
+      +materialized: view
+      +schema: staging
+
+    marts:
+      # Tables. A mart is read repeatedly by dashboards and is worth computing
+      # once.
+      +materialized: table
+      +schema: marts
+
+seeds:
+  bigdata_platform:
+    +schema: seeds
