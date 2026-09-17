@@ -1,12 +1,9 @@
-# Boots the platform without the ClickHouse cluster, starts Airflow, and
-# checks that the orchestration works: components up, DAGs parsed, job images
-# built, metrics flowing.
+# Boots the platform without the ClickHouse cluster and checks that Airflow is
+# usable rather than merely running: the four components up, the DAGs parsed,
+# the job images present, metrics flowing, and the jobs producing output.
 #
-# The mart job and its output are covered locally — see
-# "What continuous integration does not cover" in 04-etl/README.md.
-#
-# Triggered by every stack this one includes, because a change to any of them
-# can break it without touching a file here.
+# The warehouse checks print as SKIP; see "What continuous integration does
+# not cover" in 04-etl/README.md.
 
 name: 04-etl
 
@@ -35,9 +32,6 @@ concurrency:
 jobs:
   smoke:
     runs-on: ubuntu-latest
-    # Longer than the other stacks: this one builds two images and starts
-    # twenty-six containers, and Airflow's first start runs a schema
-    # migration before anything else can begin.
     timeout-minutes: 40
 
     defaults:
@@ -46,15 +40,24 @@ jobs:
 
     env:
       PROFILES: ""
-      SKIP_CLICKHOUSE: "1"
+      SKIP_CLICKHOUSE: 1
 
     steps:
       - uses: actions/checkout@v5
 
+      # Anonymous pulls from Docker Hub are limited per IP and runner IPs are
+      # shared. A rate limit surfaces as "repository does not exist" on a name
+      # that is plainly correct, and it lands on a different image each time.
+      - name: Log in to Docker Hub
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        if: env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Show Docker versions and memory
-        # Twenty-six containers on a 16 GiB runner is the tightest fit in this
-        # repository. Printing this makes an out-of-memory kill diagnosable
-        # rather than mysterious.
         run: |
           docker compose version
           free -h
@@ -65,11 +68,27 @@ jobs:
           cp ../03-dbms/.env.example ../03-dbms/.env
           cp ../02-monitoring/.env.example ../02-monitoring/.env
           cp ../01-kafka/.env.example ../01-kafka/.env
-          sed -i "s/^DOCKER_GID=.*/DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)/" ../02-monitoring/.env
-          # Lower the JVM limits, leave every image version as pinned. The
-          # container limits stay well above the heaps: a JVM allocates plenty
-          # outside its heap, and a container at 90% of its limit would trip
-          # ContainerNearMemoryLimit and turn a healthy run red.
+          # ------------------------------------------------------------------
+          #  The gid that owns the Docker socket, in TWO files
+          # ------------------------------------------------------------------
+          #  Prometheus needs it in 02-monitoring to read the socket for
+          #  service discovery. The Airflow scheduler needs it here, because
+          #  DockerOperator starts containers through the same socket.
+          #
+          #  A fixed value does not travel: on Docker Desktop the socket is
+          #  root:root and group 0 works; on a runner it is root:docker with a
+          #  gid around 999, where group 0 grants nothing.
+          #
+          #  This passed once by luck — the default of 0 happened to work on
+          #  that runner. It is not a property to rely on.
+          # ------------------------------------------------------------------
+          DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)
+          sed -i "s/^DOCKER_GID=.*/DOCKER_GID=${DOCKER_GID}/" ../02-monitoring/.env
+          grep -q '^DOCKER_GID=' .env \
+            && sed -i "s/^DOCKER_GID=.*/DOCKER_GID=${DOCKER_GID}/" .env \
+            || echo "DOCKER_GID=${DOCKER_GID}" >> .env
+          echo "docker socket gid: ${DOCKER_GID}"
+          # Lower the JVM limits, leave every image version as pinned.
           sed -i 's/^KAFKA_HEAP_OPTS=.*/KAFKA_HEAP_OPTS=-Xms256m -Xmx512m/' ../01-kafka/.env
           sed -i 's/^KAFKA_MEM_LIMIT=.*/KAFKA_MEM_LIMIT=1500m/' ../01-kafka/.env
           sed -i 's/^CONNECT_HEAP_OPTS=.*/CONNECT_HEAP_OPTS=-Xms256m -Xmx768m/' ../03-dbms/.env
@@ -77,26 +96,25 @@ jobs:
       - name: Validate the compose file and every include
         run: make config
 
-      - name: Build the job images
-        # DockerOperator never builds anything. Doing this as its own step
-        # means a broken job Dockerfile fails here, with its own log, instead
-        # of surfacing as "No such image" from a task twenty minutes later.
-        run: make jobs
+      # Three images in this platform are built by one service and merely
+      # referenced by another, so `up --build` tries to pull them from a
+      # registry where they have never existed. Building first puts them in
+      # the local store; `up` then fetches only what is genuinely missing.
+      - name: Build every locally built image
+        run: docker compose build
 
       - name: Start the platform and Airflow
-        run: make up-light
-
-      # Postgres, Debezium and Kafka come from the stack below and are checked
-      # by its own workflow, but the mart job needs data to exist, so capture
-      # is registered here too.
-      - name: Register the Debezium connector
-        run: cd ../03-dbms && make connector
-
-      - name: Wait for Airflow to finish starting
-        # The api-server runs a schema migration on a fresh volume and the
-        # scheduler waits for it. Ninety seconds is comfortably more than that
-        # takes on a runner, and the smoke test polls the API anyway.
-        run: sleep 90
+        run: |
+          for attempt in 1 2 3; do
+            if make up-light; then
+              echo "started on attempt ${attempt}"
+              exit 0
+            fi
+            echo "attempt ${attempt} failed, retrying in 30s"
+            sleep 30
+          done
+          echo "could not start after three attempts"
+          exit 1
 
       - name: Smoke test, without the warehouse
         run: make smoke
@@ -110,6 +128,9 @@ jobs:
           echo "=== memory ==="
           free -h
           echo ""
+          echo "=== docker socket ==="
+          ls -l /var/run/docker.sock
+          echo ""
           echo "=== DAG import errors ==="
           docker compose exec -T airflow-scheduler airflow dags list-import-errors || true
           echo ""
@@ -119,23 +140,6 @@ jobs:
           echo "=== job images ==="
           docker images --filter 'reference=dataplatform/job-*' || true
           echo ""
-          echo "=== is the statsd exporter running ==="
-          docker compose ps airflow-statsd || true
-          echo ""
-          echo "=== its labels ==="
-          docker inspect airflow-statsd --format '{{json .Config.Labels}}' 2>/dev/null | tr ',' '\n' | grep prometheus || echo "container not found"
-          echo ""
-          echo "=== its network ==="
-          docker inspect airflow-statsd --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null || true
-          echo ""
-          echo "=== does its endpoint answer ==="
-          docker compose exec -T airflow-statsd wget -qO- http://localhost:9102/metrics 2>/dev/null | head -5 || echo "no answer"
-          echo ""
-          echo "=== what docker-sd discovered ==="
-          curl -s 'http://localhost:9090/api/v1/targets?state=any' | grep -o '"__meta_docker_container_name":"/[^"]*"' | sort -u || true
-          echo ""
-          echo "=== active jobs ==="
-          curl -s 'http://localhost:9090/api/v1/targets?state=active' | grep -o '"job":"[^"]*"' | sort | uniq -c || true
           echo "=== scheduler, last 40 lines ==="
           docker compose logs --no-color --tail=40 airflow-scheduler || true
           echo ""
