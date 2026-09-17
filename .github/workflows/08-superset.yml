@@ -1,0 +1,125 @@
+# Builds the Superset image and starts it with its metadata database and
+# Redis, without the rest of the platform.
+#
+# Deliberately narrower than the lower workflows. Superset needs nothing from
+# Kafka, ClickHouse or Spark to prove it works: it needs its own Postgres, its
+# drivers, and its schema. Starting seven other stacks to reach those checks
+# would spend twenty minutes on nothing.
+#
+# The connection to the warehouse is checked locally; see
+# "What continuous integration does not cover" in 08-superset/README.md.
+
+name: 08-superset
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '08-superset/**'
+      - '.github/workflows/08-superset.yml'
+  pull_request:
+    paths:
+      - '08-superset/**'
+      - '.github/workflows/08-superset.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: 08-superset-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    defaults:
+      run:
+        working-directory: 08-superset
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # Anonymous pulls from Docker Hub are limited per IP and runner IPs are
+      # shared. A rate limit surfaces as "repository does not exist" on a name
+      # that is plainly correct, and it lands on a different image each time.
+      - name: Log in to Docker Hub
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        if: env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Show Docker versions and memory
+        run: |
+          docker compose version
+          free -h
+
+      # Only this stack's own .env. Nothing from the lower stacks is started,
+      # so their files are never read.
+      - name: Prepare .env
+        run: cp .env.example .env
+
+      # ----------------------------------------------------------------------
+      #  Build before starting, not as part of starting
+      # ----------------------------------------------------------------------
+      #  `up --build` builds and pulls concurrently, and the superset service
+      #  names dataplatform/superset without a build section of its own — only
+      #  superset-init has one. From Compose's point of view that is an image
+      #  to fetch from a registry where it has never existed:
+      #
+      #      pull access denied for dataplatform/superset,
+      #      repository does not exist or may require 'docker login'
+      #
+      #  which reads as an authentication problem and is not. The same thing
+      #  happened in step 6 with dataplatform/jmx-exporter.
+      #
+      #  The build itself asserts that both drivers import from the venv
+      #  Superset runs from, so a driver installed into the wrong interpreter
+      #  fails here rather than minutes later in a different container.
+      # ----------------------------------------------------------------------
+      - name: Build the Superset image
+        run: docker compose build superset-init
+
+      # PROFILES is empty so nothing from the included stacks starts. Only the
+      # three services this stack defines come up.
+      - name: Start Superset, its database and Redis
+        run: |
+          for attempt in 1 2 3; do
+            if docker compose up -d superset-postgres superset-redis superset-init superset; then
+              echo "started on attempt ${attempt}"
+              exit 0
+            fi
+            echo "attempt ${attempt} failed, retrying in 30s"
+            sleep 30
+          done
+          echo "could not start after three attempts"
+          exit 1
+
+      - name: Smoke test
+        run: make smoke
+
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== container status ==="
+          docker compose ps -a
+          echo ""
+          echo "=== memory ==="
+          free -h
+          echo ""
+          echo "=== drivers, from the venv Superset runs from ==="
+          docker run --rm --entrypoint /app/.venv/bin/python \
+            dataplatform/superset:$(grep -E '^SUPERSET_VERSION=' .env | cut -d= -f2) \
+            -c "import psycopg2, clickhouse_connect; print(psycopg2.__version__, clickhouse_connect.__version__)" || true
+          echo ""
+          echo "=== superset-init, in full ==="
+          docker compose logs --no-color superset-init || true
+          echo ""
+          echo "=== superset, last 50 lines ==="
+          docker compose logs --no-color --tail=50 superset || true
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

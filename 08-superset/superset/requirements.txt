@@ -1,0 +1,18 @@
+# Drivers, and the reason Superset needs an image of its own.
+#
+# The official image ships almost none — not ClickHouse, and not Postgres
+# either, despite Postgres being what Superset's own documentation recommends
+# for its metadata database. The base image is deliberately bare and every
+# deployment adds what it uses.
+
+# The ClickHouse dialect Superset expects, as `clickhousedb://`. The older
+# clickhouse-sqlalchemy also exists and is what most tutorials use; it is no
+# longer the one ClickHouse maintains.
+clickhouse-connect==1.8.0
+
+# For Superset's own metadata database. Without it `superset db upgrade` fails
+# with ModuleNotFoundError on psycopg2 before it touches a single table —
+# which reads as a broken image rather than a missing driver.
+#
+# The binary wheel, so the build needs no compiler or libpq headers.
+psycopg2-binary==2.9.10

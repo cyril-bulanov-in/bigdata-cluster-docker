@@ -1,0 +1,157 @@
+# ============================================================================
+#  PLATFORM — step 8: dashboards (part 1 — Superset itself)
+# ============================================================================
+#
+#  Superset with its own metadata database and a Redis for caching. No
+#  connection to the warehouse yet, and no dashboards: this part is about
+#  getting it running and reporting.
+#
+#  Start:  make up
+#  UI:     http://localhost:8089
+#
+# ----------------------------------------------------------------------------
+#  Port 8089, not Superset's default 8088
+# ----------------------------------------------------------------------------
+#  8088 is the dbt documentation site from step 7. Moving that would mean
+#  editing a README that already tells people where to look, so Superset moves
+#  instead. Inside the container it still listens on 8088.
+# ----------------------------------------------------------------------------
+include:
+  - ../07-dbt/docker-compose.yml
+
+name: platform
+
+services:
+
+  # ==========================================================================
+  #  Superset's metadata database
+  # ==========================================================================
+  #  Not the operational Postgres in 03-dbms, and not Airflow's.
+  #
+  #  Superset writes constantly: every dashboard edit, every saved query,
+  #  every query log entry. None of that belongs in a database being captured
+  #  by Debezium, and none of it should share a schema migration with another
+  #  tool.
+  # ==========================================================================
+  superset-postgres:
+    image: postgres:${POSTGRES_VERSION}
+    container_name: superset-postgres
+    restart: unless-stopped
+    networks: [dataplatform]
+    environment:
+      POSTGRES_DB: ${SUPERSET_DB_NAME}
+      POSTGRES_USER: ${SUPERSET_DB_USER}
+      POSTGRES_PASSWORD: ${SUPERSET_DB_PASSWORD}
+    volumes:
+      - superset-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${SUPERSET_DB_USER} -d ${SUPERSET_DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # ==========================================================================
+  #  Redis, for caching only
+  # ==========================================================================
+  #  Superset keeps four separate caches here: chart data, query results,
+  #  dashboard filter state and explore form state.
+  #
+  #  Filter state is the one that matters most and is easiest to overlook.
+  #  Without a backing store Superset keeps it in the metadata database, and
+  #  the UI grows slower with every dashboard interaction — which reads as
+  #  Superset being slow rather than as a cache that was never configured.
+  #
+  #  No Celery worker: that is for running long queries in the background, and
+  #  the marts this reads answer in milliseconds.
+  # ==========================================================================
+  superset-redis:
+    image: redis:${REDIS_VERSION}
+    container_name: superset-redis
+    restart: unless-stopped
+    networks: [dataplatform]
+    # No volume. Everything here is a cache — losing it costs one slow page
+    # load, and persisting it would mean a stale filter surviving a rebuild.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+
+  # ==========================================================================
+  #  One-shot: migrate the schema and create the admin
+  # ==========================================================================
+  #  Three commands that must run in order and must run before the web
+  #  process. `superset init` is the one people miss: it creates the default
+  #  roles and permissions, and without it the UI loads and every page is
+  #  forbidden — an authenticated admin with no rights to anything.
+  # ==========================================================================
+  superset-init:
+    build:
+      context: .
+      dockerfile: superset/Dockerfile
+      args:
+        SUPERSET_VERSION: ${SUPERSET_VERSION}
+    image: dataplatform/superset:${SUPERSET_VERSION}
+    container_name: superset-init
+    restart: "no"
+    networks: [dataplatform]
+    environment: &superset-env
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
+      SUPERSET_DB_NAME: ${SUPERSET_DB_NAME}
+      SUPERSET_DB_USER: ${SUPERSET_DB_USER}
+      SUPERSET_DB_PASSWORD: ${SUPERSET_DB_PASSWORD}
+      REDIS_HOST: superset-redis
+      # Where Superset looks for superset_config.py. It imports the module
+      # rather than reading a path, so the directory goes on PYTHONPATH and
+      # the file has to be named exactly this.
+      PYTHONPATH: /app/pythonpath
+    volumes: &superset-volumes
+      - ./superset/superset_config.py:/app/pythonpath/superset_config.py:ro
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        superset db upgrade
+        superset fab create-admin \
+          --username "${SUPERSET_ADMIN_USER}" \
+          --firstname Admin --lastname User \
+          --email "${SUPERSET_ADMIN_EMAIL}" \
+          --password "${SUPERSET_ADMIN_PASSWORD}" || true
+        superset init
+    depends_on:
+      superset-postgres:
+        condition: service_healthy
+      superset-redis:
+        condition: service_healthy
+
+  # ==========================================================================
+  #  The web process
+  # ==========================================================================
+  superset:
+    image: dataplatform/superset:${SUPERSET_VERSION}
+    container_name: superset
+    restart: unless-stopped
+    networks: [dataplatform]
+    environment: *superset-env
+    volumes: *superset-volumes
+    ports:
+      - "${SUPERSET_PORT}:8088"
+    depends_on:
+      superset-init:
+        condition: service_completed_successfully
+    healthcheck:
+      # /health is served before Superset has finished loading its metadata,
+      # so this says the process is alive rather than that the UI works. The
+      # smoke test checks something stronger.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8088/health || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+volumes:
+  superset-postgres-data:
