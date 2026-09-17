@@ -1,14 +1,17 @@
 # ============================================================================
 #  What must be true of the staging models
 # ============================================================================
-#  These run on `dbt test` and, more usefully, on `dbt build` — where a failing
-#  test stops the models that depend on it rather than letting a bad number
-#  propagate into a mart and out to a dashboard.
+#  Covers the four models over the CDC tables. The three models that read
+#  Postgres and object storage are described in schema_external.yml, and the
+#  marts in ../marts/schema.yml.
 #
-#  The tests here are deliberately about structure rather than business rules:
-#  keys are unique, required columns are present, references resolve. A
-#  staging model that fails one of these is broken in a way no downstream
-#  logic can compensate for.
+#  Every generic test here uses the `arguments:` form. The older style, with
+#  the test's options directly under its name, still works and warns:
+#
+#      MissingArgumentsPropertyInGenericTestDeprecation
+#
+#  It stops working at the next major version, and a deprecation warning is
+#  easy to ignore for exactly as long as it takes to become an error.
 # ============================================================================
 
 version: 2
@@ -48,11 +51,6 @@ models:
         description: Where the order is in its lifecycle.
         data_tests:
           - not_null
-          # `arguments` rather than the test's options sitting directly under
-          # its name. The older form still works and warns with
-          # MissingArgumentsPropertyInGenericTestDeprecation; it stops working
-          # in the next major version, and a deprecation warning is easy to
-          # ignore for exactly as long as it takes to become an error.
           - accepted_values:
               arguments:
                 # Written out rather than left open so that a new status added

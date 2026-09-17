@@ -1,20 +1,60 @@
 # ============================================================================
-#  PLATFORM — step 7: dbt (part 1 — the project and the connection)
+#  PLATFORM — step 7: dbt
 # ============================================================================
 #
-#  This stack adds no long-running services, and that is the point rather than
-#  an omission. dbt is a job: Airflow runs `dbt build`, the container exits.
-#  Declaring it as a service in compose would invite exactly the confusion
-#  this repository is built to avoid.
+#  dbt itself is not a service: Airflow runs `dbt build`, the container exits.
+#  One thing here IS a service — the generated documentation, which is worth
+#  having at an address rather than behind a command that has to be running.
 #
-#  The file exists so that `make up` from here starts the whole platform
-#  underneath — and so a later part can add the one thing that IS a service,
-#  the documentation site.
-#
-#  Start:  make up          the platform
-#          make dbt-debug   does dbt reach ClickHouse
+#  Start:  make up            the platform, and build the dbt image
+#          make dbt-build-all  run the models and their tests
+#          make docs           generate the documentation and serve it
+#  Docs:   http://localhost:8088
 # ============================================================================
 include:
   - ../06-spark/docker-compose.yml
 
 name: platform
+
+services:
+
+  # ==========================================================================
+  #  The documentation site
+  # ==========================================================================
+  #  Static files produced by `dbt docs generate`, served by nginx.
+  #
+  #  `dbt docs serve` would be simpler and is deliberately not used: it starts
+  #  a single-user server that dies with the command. This survives, has an
+  #  address, and sits alongside Grafana and the Spark UI as something the
+  #  platform offers rather than something an operator remembers to run.
+  #
+  #  The volume is shared with the dbt image: `make docs` runs dbt with the
+  #  same volume mounted, so generating and serving are the same files rather
+  #  than a copy that drifts.
+  # ==========================================================================
+  dbt-docs:
+    image: nginx:${NGINX_VERSION}
+    container_name: dbt-docs
+    restart: unless-stopped
+    networks: [dataplatform]
+
+    volumes:
+      - dbt-docs-site:/usr/share/nginx/html:ro
+      - ./docs/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+
+    ports:
+      - "${DBT_DOCS_PORT}:80"
+
+    healthcheck:
+      # Checks that index.html is actually being served, not merely that nginx
+      # answers. Before the first `make docs` the volume is empty and nginx
+      # returns 403 for a directory it cannot index — a healthy container
+      # serving nothing, which is the state worth distinguishing.
+      test: ["CMD-SHELL", "curl -fsS http://localhost/index.html >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  dbt-docs-site:

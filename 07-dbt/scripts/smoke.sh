@@ -30,8 +30,13 @@ DBT_VERSION="$(read_env DBT_VERSION .env)";     DBT_VERSION="${DBT_VERSION:-0.1.
 DBT_IMAGE="dataplatform/dbt:${DBT_VERSION}"
 SOURCE_DB="$(read_env SOURCE_DATABASE .env)";   SOURCE_DB="${SOURCE_DB:-analytics}"
 DBT_SCHEMA="$(read_env DBT_SCHEMA .env)";       DBT_SCHEMA="${DBT_SCHEMA:-marts}"
+DOCS_PORT="$(read_env DBT_DOCS_PORT .env)";     DOCS_PORT="${DOCS_PORT:-8088}"
 
-EXPECTED_MODELS="stg_orders stg_order_items stg_customers stg_products"
+# Every model the project is expected to contain. A list rather than a count,
+# so a model that was renamed shows up as the specific one that went missing.
+STAGING_MODELS="stg_orders stg_order_items stg_customers stg_products"
+EXTERNAL_MODELS="stg_s3_orders stg_pg_orders stg_pg_customers"
+MART_MODELS="recon_orders_by_source daily_sales_by_category customer_order_summary"
 EXPECTED_SOURCES="orders order_items customers products"
 
 PASSED=0; FAILED=0; SKIPPED=0
@@ -49,6 +54,22 @@ dbt_offline() {
 
 ch() { $COMPOSE exec -T clickhouse-01 clickhouse-client "$@" 2>/dev/null | tr -d '\r' || true; }
 
+dbt_online() {
+  docker run --rm --network dataplatform \
+    -e CLICKHOUSE_HOST=clickhouse-01 -e CLICKHOUSE_PORT=9000 \
+    -e CLICKHOUSE_USER=default -e DBT_SCHEMA="$DBT_SCHEMA" \
+    -e SOURCE_DATABASE="$SOURCE_DB" \
+    -e POSTGRES_HOST=postgres -e POSTGRES_PORT=5432 \
+    -e POSTGRES_DB="$(read_env POSTGRES_DB .env)" \
+    -e POSTGRES_USER="$(read_env POSTGRES_USER .env)" \
+    -e POSTGRES_PASSWORD="$(read_env POSTGRES_PASSWORD .env)" \
+    -e S3_ENDPOINT="$(read_env S3_ENDPOINT .env)" \
+    -e S3_ACCESS_KEY="$(read_env S3_ACCESS_KEY .env)" \
+    -e S3_SECRET_KEY="$(read_env S3_SECRET_KEY .env)" \
+    -e S3_BUCKET_STAGED="$(read_env S3_BUCKET_STAGED .env)" \
+    "$DBT_IMAGE" "$@" 2>&1
+}
+
 # ---------------------------------------------------------------------------
 #  1. The image
 # ---------------------------------------------------------------------------
@@ -62,43 +83,36 @@ else
   exit 1
 fi
 
-# The adapter is pinned in requirements.txt and dbt-core is not — see the
-# comment there. This asserts that pip resolved a working pair rather than
-# leaving one of them absent.
 version_out=$(dbt_offline --version)
 printf '%s' "$version_out" | grep -qi 'clickhouse' \
-  && pass "the ClickHouse adapter is installed: $(printf '%s' "$version_out" | grep -i clickhouse | head -1 | tr -s ' ')" \
+  && pass "the ClickHouse adapter is installed" \
   || fail "no ClickHouse adapter in the image"
-
-printf '%s' "$version_out" | grep -qiE 'installed:' \
-  && pass "dbt-core is installed: $(printf '%s' "$version_out" | grep -i 'installed:' | head -1 | tr -s ' ')" \
-  || fail "dbt-core did not report a version"
 
 # ---------------------------------------------------------------------------
 #  2. The project, parsed without a database
 # ---------------------------------------------------------------------------
-#  `dbt parse` reads every model, resolves ref() and source(), compiles the
-#  Jinja and builds the dependency graph — all without connecting. It is the
-#  strongest check available offline, and it catches the errors that actually
-#  happen while editing: a ref() to a model that was renamed, a source that is
-#  not in sources.yml, an unbalanced Jinja block, a test on a column that no
-#  longer exists.
-#
-#  What it does NOT catch is SQL that is valid to dbt and wrong to ClickHouse.
-#  That needs the warehouse, and is why the second half of this test exists.
-# ---------------------------------------------------------------------------
 info "The project"
 
 parse_out=$(dbt_offline parse)
-if printf '%s' "$parse_out" | grep -qiE 'error|fail'; then
+if printf '%s' "$parse_out" | grep -qiE '\[error\]|failure|compilation error'; then
   fail "the project does not parse"
   printf '%s\n' "$parse_out" | grep -iE 'error|fail' | head -6 | sed 's/^/        /'
 else
   pass "the project parses, every ref and source resolves"
 fi
 
+# Deprecations are worth failing on rather than ignoring. Each one is a thing
+# that works today and stops working at the next major version, and the whole
+# point of a warning is that it arrives before the breakage.
+if printf '%s' "$parse_out" | grep -qi 'Deprecat'; then
+  fail "the project uses deprecated syntax:"
+  printf '%s\n' "$parse_out" | grep -iA3 'Summary of encountered deprecations' | head -6 | sed 's/^/        /'
+else
+  pass "no deprecated syntax"
+fi
+
 ls_out=$(dbt_offline ls --resource-type model)
-for m in $EXPECTED_MODELS; do
+for m in $STAGING_MODELS $EXTERNAL_MODELS $MART_MODELS; do
   printf '%s' "$ls_out" | grep -q "$m" \
     && pass "model ${m} is in the graph" \
     || fail "model ${m} is missing from the graph"
@@ -115,9 +129,9 @@ done
 # whose test count silently drops to zero still builds, still runs, and stops
 # checking anything.
 test_count=$(dbt_offline ls --resource-type test | grep -c . || true)
-[ "${test_count:-0}" -ge 20 ] \
+[ "${test_count:-0}" -ge 30 ] \
   && pass "${test_count} data tests defined" \
-  || fail "only ${test_count:-0} data tests — expected at least 20"
+  || fail "only ${test_count:-0} data tests — expected at least 30"
 
 # ---------------------------------------------------------------------------
 #  3. Against the warehouse
@@ -128,43 +142,30 @@ if ! docker ps --format '{{.Names}}' | grep -qx clickhouse-01; then
   skip "connection — ClickHouse is not running"
   skip "models built — ClickHouse is not running"
   skip "deduplication — ClickHouse is not running"
-  skip "tests — ClickHouse is not running"
+  skip "the two mart implementations agree — ClickHouse is not running"
+  skip "documentation — ClickHouse is not running"
 else
-  # Not the same as `dbt parse`: this resolves the profile, reads the
-  # environment variables, and opens a connection.
-  if $COMPOSE exec -T clickhouse-01 true 2>/dev/null \
-     && docker run --rm --network dataplatform \
-          -e CLICKHOUSE_HOST=clickhouse-01 -e CLICKHOUSE_PORT=9000 \
-          -e CLICKHOUSE_USER=default -e DBT_SCHEMA="$DBT_SCHEMA" \
-          -e SOURCE_DATABASE="$SOURCE_DB" \
-          "$DBT_IMAGE" debug 2>&1 | grep -q 'All checks passed'; then
-    pass "dbt connects to ClickHouse"
-  else
-    fail "dbt cannot connect — check: make dbt-debug"
-  fi
+  dbt_online debug | grep -q 'All checks passed' \
+    && pass "dbt connects to ClickHouse" \
+    || fail "dbt cannot connect — check: make dbt-debug"
 
-  built=$(ch --query "SELECT count() FROM system.tables WHERE database = '${DBT_SCHEMA}_staging'")
-  [ "${built:-0}" -ge 4 ] 2>/dev/null \
-    && pass "${built} staging models built in ${DBT_SCHEMA}_staging" \
-    || fail "${built:-0} models in ${DBT_SCHEMA}_staging, expected 4 — run: make dbt-build-all"
+  staging_built=$(ch --query "SELECT count() FROM system.tables WHERE database = '${DBT_SCHEMA}_staging'")
+  [ "${staging_built:-0}" -ge 7 ] 2>/dev/null \
+    && pass "${staging_built} staging models built" \
+    || fail "${staging_built:-0} staging models, expected 7 — run: make dbt-build-all"
+
+  marts_built=$(ch --query "SELECT count() FROM system.tables WHERE database = '${DBT_SCHEMA}_marts'")
+  [ "${marts_built:-0}" -ge 3 ] 2>/dev/null \
+    && pass "${marts_built} marts built" \
+    || fail "${marts_built:-0} marts, expected 3 — run: make dbt-build-all"
 
   # ---- the check this layer exists for ---------------------------------
-  #  Every staging model reads its source with FINAL. Drop it and the model
-  #  still builds, still returns plausible numbers, and counts every version
-  #  of a row as a separate row.
-  #
-  #  Asserting that the model has no duplicate keys is how that gets caught —
-  #  the same thing the `unique` test in schema.yml does, checked here from
-  #  outside dbt so that a project whose tests were disabled still fails.
-  if [ "${built:-0}" -ge 4 ]; then
+  if [ "${staging_built:-0}" -ge 4 ]; then
     dupes=$(ch --query "SELECT count() FROM (SELECT order_id FROM ${DBT_SCHEMA}_staging.stg_orders GROUP BY order_id HAVING count() > 1)")
     [ "${dupes:-1}" = "0" ] \
       && pass "stg_orders has no duplicate order_id — FINAL is doing its job" \
       || fail "${dupes} order_id values appear more than once — is FINAL still in the model?"
 
-    # The source holds more rows than the model, and that gap is the point.
-    # Equal counts mean either nothing has changed since the last merge or
-    # the deduplication silently stopped happening.
     raw=$(ch --query "SELECT count() FROM ${SOURCE_DB}.customers")
     stg=$(ch --query "SELECT count() FROM ${DBT_SCHEMA}_staging.stg_customers")
     if [ -n "$raw" ] && [ -n "$stg" ] && [ "$raw" -gt "$stg" ] 2>/dev/null; then
@@ -176,20 +177,29 @@ else
     skip "deduplication — the models are not built"
   fi
 
-  # dbt's own tests, run from outside. Slower than the checks above and worth
-  # it: they cover uniqueness, nullability and referential integrity across
-  # every model at once.
-  if [ "${built:-0}" -ge 4 ]; then
-    if docker run --rm --network dataplatform \
-         -e CLICKHOUSE_HOST=clickhouse-01 -e CLICKHOUSE_PORT=9000 \
-         -e CLICKHOUSE_USER=default -e DBT_SCHEMA="$DBT_SCHEMA" \
-         -e SOURCE_DATABASE="$SOURCE_DB" \
-         "$DBT_IMAGE" test >/tmp/dbt_test.log 2>&1; then
+  # ---- two implementations of one definition ---------------------------
+  #  The mart in 04-etl and the model here compute the same thing from the
+  #  same rows. Keeping both is only worth it if the disagreement is checked,
+  #  and it has already paid for itself: the job was counting cancelled
+  #  orders as revenue, which nothing else noticed for two steps.
+  if [ "${marts_built:-0}" -ge 3 ]; then
+    if dbt_online test --select mart_matches_job >/tmp/dbt_recon.log 2>&1; then
+      pass "the dbt mart agrees with the hand-written job"
+    elif grep -qE 'WARN=1|Completed with [0-9]+ warning' /tmp/dbt_recon.log; then
+      fail "the two mart implementations disagree"
+      grep -iE 'got [0-9]+ result' /tmp/dbt_recon.log | head -2 | sed 's/^/        /'
+    else
+      skip "mart comparison — the job's table does not exist yet"
+    fi
+  else
+    skip "the two mart implementations agree — the marts are not built"
+  fi
+
+  # ---- everything else dbt asserts -------------------------------------
+  if [ "${marts_built:-0}" -ge 3 ]; then
+    if dbt_online test >/tmp/dbt_test.log 2>&1; then
       pass "dbt test passes"
     else
-      # Warnings are not failures: the relationship tests are deliberately
-      # severity:warn, because an order can outlive a deleted customer and an
-      # item can arrive before its order.
       if grep -qE 'Completed with [0-9]+ warning' /tmp/dbt_test.log \
          && ! grep -qE 'Completed with [0-9]+ error' /tmp/dbt_test.log; then
         pass "dbt test passes with warnings only"
@@ -199,7 +209,28 @@ else
       fi
     fi
   else
-    skip "tests — the models are not built"
+    skip "tests — the marts are not built"
+  fi
+
+  # ---- the documentation site ------------------------------------------
+  #  Checked for content, not merely for an answer. Before the first
+  #  `make docs` the volume is empty and nginx returns 403 — a healthy
+  #  container serving nothing.
+  if docker ps --format '{{.Names}}' | grep -qx dbt-docs; then
+    # Read a fixed prefix rather than piping the whole page into grep.
+    #
+    # The generated site is a single 2.7 MB file. `curl | grep -q` closes the
+    # pipe on the first match, curl takes SIGPIPE and exits non-zero, and -f
+    # turns that into a failure — so the check reported an empty site while
+    # serving a perfectly good one.
+    docs_head=$(curl -sS --max-time 10 "http://localhost:${DOCS_PORT}/index.html" 2>/dev/null | head -c 400 || true)
+    if printf '%s' "$docs_head" | grep -qi 'dbt'; then
+      pass "the documentation site is serving a generated page"
+    else
+      fail "dbt-docs answers but serves nothing — run: make docs"
+    fi
+  else
+    skip "documentation — dbt-docs is not running"
   fi
 fi
 

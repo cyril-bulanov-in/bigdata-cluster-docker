@@ -2,13 +2,13 @@
 #
 # This stack includes 06-spark and everything below it, so `make up` here
 # starts the whole platform. dbt itself is not a service — it is an image that
-# runs and exits.
+# runs and exits. The one service here is the documentation site.
 #
-#   make             - list the available commands
-#   make up          - start the platform and build the dbt image
-#   make dbt-debug   - can dbt reach ClickHouse
+#   make               - list the available commands
+#   make up            - start the platform and build the dbt image
 #   make dbt-build-all - run the models and their tests, in dependency order
-#   make clean       - stop everything and wipe every volume in the project
+#   make docs          - generate the documentation and serve it
+#   make clean         - stop everything and wipe every volume in the project
 
 PROFILES ?= --profile clickhouse
 COMPOSE := docker compose $(PROFILES)
@@ -27,15 +27,21 @@ DBT_VERSION := $(or $(call getenv,DBT_VERSION,$(ENV)),0.1.0)
 DBT_IMAGE   := dataplatform/dbt:$(DBT_VERSION)
 SOURCE_DB   := $(or $(call getenv,SOURCE_DATABASE,$(ENV)),analytics)
 DBT_SCHEMA  := $(or $(call getenv,DBT_SCHEMA,$(ENV)),marts)
+DOCS_PORT   := $(or $(call getenv,DBT_DOCS_PORT,$(ENV)),8088)
 
 CH := $(COMPOSE) exec -T clickhouse-01 clickhouse-client
+
+# The volume the docs site is served from. `make docs` mounts it into the dbt
+# container so generating and serving are the same files, not a copy that
+# drifts. The name is the compose project plus the volume name.
+DOCS_VOLUME := platform_dbt-docs-site
 
 # ----------------------------------------------------------------------------
 #  Everything dbt needs, as environment variables
 # ----------------------------------------------------------------------------
 #  Collected once here rather than repeated on every target. profiles.yml and
-#  the source definitions read them through env_var, so the image carries no
-#  addresses and no credentials of its own.
+#  the macros read them through env_var, so the image carries no addresses and
+#  no credentials of its own.
 # ----------------------------------------------------------------------------
 DBT_ENV := \
   -e CLICKHOUSE_HOST=$(or $(call getenv,CLICKHOUSE_HOST,$(ENV)),clickhouse-01) \
@@ -67,7 +73,8 @@ DBT_DEV := docker run --rm --network dataplatform $(DBT_ENV) \
 .DEFAULT_GOAL := help
 .PHONY: help check-env up up-light down restart clean ps logs config urls \
         dbt-build dbt-version dbt-debug dbt-ls dbt-run dbt-test dbt-build-all \
-        dbt-freshness dbt-compare dbt-dev dbt-shell models smoke test
+        dbt-freshness dbt-compare dbt-dev dbt-shell models \
+        docs docs-generate docs-open smoke test
 
 help: ## show this list
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
@@ -101,13 +108,12 @@ clean: ## stop everything and delete every volume in the project
 
 urls: ## print the web interfaces
 	@echo ""
+	@echo "  dbt docs       http://localhost:$(DOCS_PORT)   (run: make docs)"
 	@echo "  Spark master   http://localhost:8090"
 	@echo "  MinIO console  http://localhost:9001"
 	@echo "  Airflow        http://localhost:8081"
 	@echo "  ClickHouse     http://localhost:8123/play"
 	@echo "  Grafana        http://localhost:3000"
-	@echo ""
-	@echo "  dbt is not a service. Check it with:  make dbt-debug"
 	@echo ""
 
 # --- dbt --------------------------------------------------------------------
@@ -116,11 +122,8 @@ urls: ## print the web interfaces
 #
 # check-env requires the .env of every stack below, because `make up` starts
 # the whole platform. Building an image needs none of that — it reads the
-# Dockerfile and the project directory and nothing else.
-#
-# The distinction is not academic: the CI workflow builds and parses without
-# starting anything, and hanging check-env here made it demand six .env files
-# for stacks it never touches.
+# Dockerfile and the project directory and nothing else. Hanging check-env
+# here made CI demand six .env files for stacks it never touches.
 dbt-build: ## build the dbt image
 	@printf 'building %s ... ' "$(DBT_IMAGE)"
 	@docker build -q -t $(DBT_IMAGE) -f dbt/Dockerfile . >/dev/null \
@@ -161,16 +164,6 @@ dbt-build-all: ## run and test in dependency order
 dbt-freshness: ## how old is the newest row in each source
 	@$(DBT) source freshness
 
-# ----------------------------------------------------------------------------
-#  Does FINAL actually do anything
-# ----------------------------------------------------------------------------
-#  Compares each staging model against its source counted without FINAL. The
-#  source number is higher by however many versions change capture has
-#  produced, and that gap is the whole reason the staging layer exists.
-#
-#  If the two ever match exactly for orders, either nothing has been updated
-#  since the last merge — or FINAL has quietly been dropped from the model.
-# ----------------------------------------------------------------------------
 dbt-compare: ## staging rows against raw source rows, per table
 	@printf '  %-16s %-14s %-14s %s\n' "table" "source rows" "staged rows" "versions collapsed"
 	@for t in orders order_items customers products; do \
@@ -190,6 +183,35 @@ models: ## which tables and views dbt has created
 	@$(CH) --query "SELECT database, name, engine FROM system.tables WHERE database LIKE '$(DBT_SCHEMA)%' ORDER BY database, name FORMAT PrettyCompact" \
 	  2>/dev/null || echo "  nothing built yet — run: make dbt-build-all"
 
+# --- documentation ----------------------------------------------------------
+
+# ----------------------------------------------------------------------------
+#  Generated into the volume nginx serves
+# ----------------------------------------------------------------------------
+#  `dbt docs generate` needs a live connection: the catalogue comes from
+#  querying the warehouse for what was actually created, which is what makes
+#  the site show real column types rather than what the models claim.
+#
+#  The output lands in the shared volume rather than in ./project/target, so
+#  the site nginx serves and the files dbt just wrote are the same bytes.
+# ----------------------------------------------------------------------------
+docs-generate: ## generate the documentation
+	@docker run --rm --network dataplatform $(DBT_ENV) \
+	  -v $(DOCS_VOLUME):/docs-out \
+	  --entrypoint sh $(DBT_IMAGE) -c \
+	  'dbt docs generate --static --target-path /tmp/target \
+	   && cp /tmp/target/static_index.html /docs-out/index.html'
+	@echo "  documentation written"
+
+docs: docs-generate ## generate the documentation and print where to read it
+	@$(COMPOSE) up -d dbt-docs >/dev/null 2>&1 || true
+	@echo ""
+	@echo "  dbt docs  http://localhost:$(DOCS_PORT)"
+	@echo ""
+	@echo "  The lineage graph is the point: click any model to see what it"
+	@echo "  reads and what reads it."
+	@echo ""
+
 # Iterate without rebuilding. The local project is mounted over the one in the
 # image, so an edit to a model takes effect on the next command.
 dbt-dev: ## run a dbt command against the local project (CMD="run --select x")
@@ -199,13 +221,7 @@ dbt-shell: ## a shell in the dbt image, project mounted
 	@docker run --rm -it --network dataplatform $(DBT_ENV) \
 	  -v $(PWD)/project:/dbt --entrypoint bash $(DBT_IMAGE)
 
-# --- inspection -------------------------------------------------------------
-
-ps: ## container status
-	$(COMPOSE) ps
-
-logs: ## follow every service
-	$(COMPOSE) logs -f
+# --- checks -----------------------------------------------------------------
 
 # Half of this runs with no database at all, which is what CI uses. The rest
 # needs ClickHouse and skips without it.
@@ -216,3 +232,11 @@ test: smoke ## the smoke test; see also `make config` for the compose files
 
 config: check-env ## validate the compose file and the includes
 	@$(COMPOSE) config -q && echo "compose file is valid, all variables resolved"
+
+# --- inspection -------------------------------------------------------------
+
+ps: ## container status
+	$(COMPOSE) ps
+
+logs: ## follow every service
+	$(COMPOSE) logs -f

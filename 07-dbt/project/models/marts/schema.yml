@@ -1,10 +1,9 @@
 # ============================================================================
 #  Marts
 # ============================================================================
-#  Goes in models/marts/. The other schema.yml, with the four stg_* models,
-#  belongs in models/staging/ — dbt reads both, and a model described in the
-#  wrong file produces "model not found" for the one and "unused config" for
-#  the other.
+#  Goes in models/marts/. The schema.yml with the four stg_* models belongs in
+#  models/staging/ — dbt reads both, and a model described in the wrong file
+#  produces "model not found" for one and "unused config" for the other.
 # ============================================================================
 
 version: 2
@@ -32,11 +31,6 @@ models:
           DIVERGED.
         data_tests:
           - not_null
-          # `arguments` rather than the options sitting directly under the
-          # test name. The older form still works and warns with
-          # MissingArgumentsPropertyInGenericTestDeprecation; it stops working
-          # in the next major version, and a deprecation warning is easy to
-          # ignore for exactly as long as it takes to become an error.
           - accepted_values:
               arguments:
                 values: ['exact', 'within tolerance', 'missing from warehouse', 'not in source', 'DIVERGED']
