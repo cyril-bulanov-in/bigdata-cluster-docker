@@ -109,17 +109,36 @@ x-airflow: &airflow
     AIRFLOW__CORE__DEFAULT_TIMEZONE: UTC
 
   volumes:
-    # Not read-only, and the flag was removed rather than never added.
+    # ------------------------------------------------------------------------
+    #  Not read-only, and three mounts rather than one
+    # ------------------------------------------------------------------------
+    #  Airflow never writes to dags/, so :ro looked like free safety. What it
+    #  did instead was make the directory impossible to extend — Docker cannot
+    #  create a mountpoint inside a read-only mount:
     #
-    # Airflow never writes here, so :ro looked like free safety. What it
-    # actually did was make the directory impossible to extend: step 7 mounts
-    # its own DAG into this path, and Docker cannot create a mountpoint inside
-    # a read-only mount —
+    #      make mountpoint ".../dags/40_dbt_cosmos.py": read-only file system
     #
-    #     make mountpoint ".../dags/40_dbt_cosmos.py": read-only file system
+    #  The two mounts from 07-dbt are declared HERE rather than in that stack,
+    #  and that placement is the fix for a second problem. A compose file can
+    #  add to a service an included file defined — on some Compose versions.
+    #  Others reject it outright:
     #
-    # The flag protected against nothing and blocked something real.
+    #      services.airflow-scheduler conflicts with imported resource
+    #
+    #  which passed locally and failed on the CI runner, on nothing but a
+    #  version difference. Declaring every mount where the service itself is
+    #  declared works everywhere.
+    #
+    #  The consequence to accept: this stack now references a directory
+    #  belonging to a later one. Airflow orchestrates the whole platform, so
+    #  it has to see every DAG — pretending otherwise is what produced a DAG
+    #  that could not be parsed in the stack it lived in.
+    # ------------------------------------------------------------------------
     - ./dags:/opt/airflow/dags
+    - ../07-dbt/dags/40_dbt_cosmos.py:/opt/airflow/dags/40_dbt_cosmos.py:ro
+    # Cosmos builds its task graph from this project's manifest at DAG parse
+    # time. It reads nothing else here, and needs no dbt of its own.
+    - ../07-dbt/project:/opt/dbt-project:ro
     - airflow-logs:/opt/airflow/logs
 
   depends_on:
@@ -208,10 +227,12 @@ services:
     group_add:
       - "${DOCKER_GID:-0}"
     # The anchor's volumes are replaced rather than extended, so this list
-    # repeats them. Compose does not merge a key that a service redefines —
-    # which is why the :ro removal above has to be made here as well.
+    # repeats them. Compose does not merge a key a service redefines — which
+    # is why every change above has to be made here as well.
     volumes:
       - ./dags:/opt/airflow/dags
+      - ../07-dbt/dags/40_dbt_cosmos.py:/opt/airflow/dags/40_dbt_cosmos.py:ro
+      - ../07-dbt/project:/opt/dbt-project:ro
       - airflow-logs:/opt/airflow/logs
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:

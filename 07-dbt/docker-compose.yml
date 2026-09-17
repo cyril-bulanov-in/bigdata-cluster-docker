@@ -2,52 +2,36 @@
 #  PLATFORM — step 7: dbt
 # ============================================================================
 #
-#  dbt itself is not a service: a container runs one model and exits. Two
-#  things here are services — the generated documentation, and the parts of
-#  Airflow that need to see the project in order to orchestrate it.
+#  dbt is not a service: a container runs one model and exits. The one service
+#  here is the generated documentation, which is worth having at an address
+#  rather than behind a command that has to stay running.
 #
 #  Start:  make up             the platform, and build the dbt image
 #          make manifest       let Airflow see the current graph
 #          make dbt-build-all  run the models and their tests
 #          make docs           generate the documentation and serve it
 #  Docs:   http://localhost:8088
-# ============================================================================
+#
+# ----------------------------------------------------------------------------
+#  Where the Airflow mounts went
+# ----------------------------------------------------------------------------
+#  This file used to add two volumes to airflow-scheduler, airflow-apiserver
+#  and airflow-dag-processor — the dbt project and this stack's DAG. Compose
+#  merges such an addition on some versions and refuses it on others:
+#
+#      services.airflow-scheduler conflicts with imported resource
+#
+#  which worked locally and failed on the CI runner, on nothing but a version
+#  difference. Both mounts now live in 04-etl, where those services are
+#  declared. Declaring a service's volumes where the service itself is
+#  declared works everywhere.
+# ----------------------------------------------------------------------------
 include:
   - ../06-spark/docker-compose.yml
 
 name: platform
 
 services:
-
-  # ==========================================================================
-  #  Airflow, extended rather than redefined
-  # ==========================================================================
-  #  These three services are defined in 04-etl. Naming them here adds to
-  #  those definitions instead of replacing them: compose merges the volume
-  #  lists, so everything 04-etl mounts is still mounted.
-  #
-  #  What is added is the dbt project, read-only. Cosmos builds the task graph
-  #  from target/manifest.json at DAG parse time, and reads profiles.yml — it
-  #  needs no dbt, no adapter and no database driver, because the models
-  #  themselves run in containers from dataplatform/dbt.
-  #
-  #  All three need it: the dag-processor to parse the DAG, the scheduler and
-  #  the api-server to render it.
-  # ==========================================================================
-  airflow-dag-processor:
-    volumes:
-      - ./project:/opt/dbt-project:ro
-      - ./dags/40_dbt_cosmos.py:/opt/airflow/dags/40_dbt_cosmos.py:ro
-
-  airflow-scheduler:
-    volumes:
-      - ./project:/opt/dbt-project:ro
-      - ./dags/40_dbt_cosmos.py:/opt/airflow/dags/40_dbt_cosmos.py:ro
-
-  airflow-apiserver:
-    volumes:
-      - ./project:/opt/dbt-project:ro
-      - ./dags/40_dbt_cosmos.py:/opt/airflow/dags/40_dbt_cosmos.py:ro
 
   # ==========================================================================
   #  The documentation site
