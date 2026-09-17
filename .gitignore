@@ -36,6 +36,37 @@ __pycache__/
 venv/
 
 # dbt
-target/
 dbt_packages/
 .user.yml
+
+# ---------------------------------------------------------------------------
+#  dbt build output, with one exception
+# ---------------------------------------------------------------------------
+#  target/ holds compiled SQL, run results and logs — all regenerated on every
+#  invocation and none of it worth tracking.
+#
+#  manifest.json is different. It is not a build artifact here but a contract
+#  between two stacks: Cosmos reads it to decide what Airflow schedules. A
+#  manifest that has fallen behind the models means tasks that silently never
+#  run — the DAG renders perfectly, one task short, and nothing says so.
+#
+#  Tracking it is what lets CI compare the committed manifest against the
+#  committed models. Generating it in the workflow instead would compare a
+#  file against the project it was just generated from, which always agrees
+#  and proves nothing.
+#
+#  Note the pattern: `target/*` and not `target/`. Git does not look inside an
+#  excluded directory, so a negation under a plain `target/` never matches —
+#  the file stays ignored and the exception appears to do nothing.
+#
+#  The cost is a large JSON with noisy diffs, and a conflict whenever two
+#  people change models at once. Regenerate rather than resolve:
+#      cd 07-dbt && make manifest
+# ---------------------------------------------------------------------------
+# Note the leading **. A pattern containing a slash anywhere but the end is
+# anchored to the repository root, so `target/*` matched only a target/ beside
+# this file and left 07-dbt/project/target/ entirely untracked-but-unignored.
+# The plain `target/` it replaced worked precisely because a trailing slash is
+# the one form that still matches at any depth.
+**/target/*
+!**/target/manifest.json
