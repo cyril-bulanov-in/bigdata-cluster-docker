@@ -45,11 +45,14 @@ fail() { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; FAILED=$((FAILED + 1)); }
 skip() { printf '  \033[33mSKIP\033[0m  %s\n' "$1"; SKIPPED=$((SKIPPED + 1)); }
 info() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 
-# dbt with no network and no credentials. Parsing needs neither, and running
-# it this way proves that: a check that quietly depended on a live connection
-# would pass here and fail in CI.
+# The word dbt is part of the command, not the entrypoint.
+#
+# The image deliberately has no ENTRYPOINT: Cosmos builds the full command
+# itself starting with `dbt`, and an entrypoint of ["dbt"] makes the container
+# run `dbt dbt run`, which fails with "No such command 'dbt'" — an error that
+# reads as dbt being absent from an image that plainly contains it.
 dbt_offline() {
-  docker run --rm --network none "$DBT_IMAGE" "$@" 2>&1 || true
+  docker run --rm --network none "$DBT_IMAGE" dbt "$@" 2>&1 || true
 }
 
 ch() { $COMPOSE exec -T clickhouse-01 clickhouse-client "$@" 2>/dev/null | tr -d '\r' || true; }
@@ -67,7 +70,7 @@ dbt_online() {
     -e S3_ACCESS_KEY="$(read_env S3_ACCESS_KEY .env)" \
     -e S3_SECRET_KEY="$(read_env S3_SECRET_KEY .env)" \
     -e S3_BUCKET_STAGED="$(read_env S3_BUCKET_STAGED .env)" \
-    "$DBT_IMAGE" "$@" 2>&1
+    "$DBT_IMAGE" dbt "$@" 2>&1
 }
 
 # ---------------------------------------------------------------------------

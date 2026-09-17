@@ -2,11 +2,12 @@
 #  PLATFORM — step 7: dbt
 # ============================================================================
 #
-#  dbt itself is not a service: Airflow runs `dbt build`, the container exits.
-#  One thing here IS a service — the generated documentation, which is worth
-#  having at an address rather than behind a command that has to be running.
+#  dbt itself is not a service: a container runs one model and exits. Two
+#  things here are services — the generated documentation, and the parts of
+#  Airflow that need to see the project in order to orchestrate it.
 #
-#  Start:  make up            the platform, and build the dbt image
+#  Start:  make up             the platform, and build the dbt image
+#          make manifest       let Airflow see the current graph
 #          make dbt-build-all  run the models and their tests
 #          make docs           generate the documentation and serve it
 #  Docs:   http://localhost:8088
@@ -19,6 +20,33 @@ name: platform
 services:
 
   # ==========================================================================
+  #  Airflow, extended rather than redefined
+  # ==========================================================================
+  #  These three services are defined in 04-etl. Naming them here adds to
+  #  those definitions instead of replacing them: compose merges the volume
+  #  lists, so everything 04-etl mounts is still mounted.
+  #
+  #  What is added is the dbt project, read-only. Cosmos builds the task graph
+  #  from target/manifest.json at DAG parse time, and reads profiles.yml — it
+  #  needs no dbt, no adapter and no database driver, because the models
+  #  themselves run in containers from dataplatform/dbt.
+  #
+  #  All three need it: the dag-processor to parse the DAG, the scheduler and
+  #  the api-server to render it.
+  # ==========================================================================
+  airflow-dag-processor:
+    volumes:
+      - ./project:/opt/dbt-project:ro
+
+  airflow-scheduler:
+    volumes:
+      - ./project:/opt/dbt-project:ro
+
+  airflow-apiserver:
+    volumes:
+      - ./project:/opt/dbt-project:ro
+
+  # ==========================================================================
   #  The documentation site
   # ==========================================================================
   #  Static files produced by `dbt docs generate`, served by nginx.
@@ -27,10 +55,6 @@ services:
   #  a single-user server that dies with the command. This survives, has an
   #  address, and sits alongside Grafana and the Spark UI as something the
   #  platform offers rather than something an operator remembers to run.
-  #
-  #  The volume is shared with the dbt image: `make docs` runs dbt with the
-  #  same volume mounted, so generating and serving are the same files rather
-  #  than a copy that drifts.
   # ==========================================================================
   dbt-docs:
     image: nginx:${NGINX_VERSION}

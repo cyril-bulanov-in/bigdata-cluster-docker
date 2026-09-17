@@ -1,11 +1,12 @@
 # Short entry points for the dbt stack.
 #
 # This stack includes 06-spark and everything below it, so `make up` here
-# starts the whole platform. dbt itself is not a service — it is an image that
-# runs and exits. The one service here is the documentation site.
+# starts the whole platform. dbt itself is not a service — a container runs
+# one model and exits. The one service here is the documentation site.
 #
 #   make               - list the available commands
 #   make up            - start the platform and build the dbt image
+#   make manifest      - let Airflow see the current model graph
 #   make dbt-build-all - run the models and their tests, in dependency order
 #   make docs          - generate the documentation and serve it
 #   make clean         - stop everything and wipe every volume in the project
@@ -61,20 +62,22 @@ DBT_ENV := \
   -e S3_SECRET_KEY=$(or $(call getenv,S3_SECRET_KEY,$(ENV)),minioadmin) \
   -e S3_BUCKET_STAGED=$(or $(call getenv,S3_BUCKET_STAGED,$(ENV)),staged)
 
-DBT := docker run --rm --network dataplatform $(DBT_ENV) $(DBT_IMAGE)
+# The image has no ENTRYPOINT — see the Dockerfile for why Cosmos requires
+# that — so the word dbt is part of every command here.
+DBT := docker run --rm --network dataplatform $(DBT_ENV) $(DBT_IMAGE) dbt
 
 # The development variant: the local project is mounted over the baked one, so
 # an edit takes effect without a rebuild. Deliberately a separate command —
 # a DAG never does this, because then the image tag would stop describing what
 # runs.
 DBT_DEV := docker run --rm --network dataplatform $(DBT_ENV) \
-  -v $(PWD)/project:/dbt $(DBT_IMAGE)
+  -v $(PWD)/project:/dbt $(DBT_IMAGE) dbt
 
 .DEFAULT_GOAL := help
 .PHONY: help check-env up up-light down restart clean ps logs config urls \
         dbt-build dbt-version dbt-debug dbt-ls dbt-run dbt-test dbt-build-all \
-        dbt-freshness dbt-compare dbt-dev dbt-shell models \
-        docs docs-generate docs-open smoke test
+        dbt-freshness dbt-compare dbt-dev dbt-shell models manifest \
+        docs docs-generate smoke test
 
 help: ## show this list
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
@@ -92,6 +95,7 @@ check-env:
 up: check-env ## start the platform and build the dbt image
 	$(COMPOSE) up -d --build
 	@$(MAKE) --no-print-directory dbt-build
+	@$(MAKE) --no-print-directory manifest
 	@$(MAKE) --no-print-directory urls
 
 up-light: ## start without the ClickHouse cluster
@@ -109,9 +113,9 @@ clean: ## stop everything and delete every volume in the project
 urls: ## print the web interfaces
 	@echo ""
 	@echo "  dbt docs       http://localhost:$(DOCS_PORT)   (run: make docs)"
+	@echo "  Airflow        http://localhost:8081   (DAG: dbt_platform)"
 	@echo "  Spark master   http://localhost:8090"
 	@echo "  MinIO console  http://localhost:9001"
-	@echo "  Airflow        http://localhost:8081"
 	@echo "  ClickHouse     http://localhost:8123/play"
 	@echo "  Grafana        http://localhost:3000"
 	@echo ""
@@ -129,9 +133,6 @@ dbt-build: ## build the dbt image
 	@docker build -q -t $(DBT_IMAGE) -f dbt/Dockerfile . >/dev/null \
 	  && echo "ok" || { echo "FAILED"; exit 1; }
 
-# Which dbt-core pip actually chose. requirements.txt pins only the adapter —
-# see the comment there — so the core version is a result rather than a
-# decision, and worth being able to read.
 dbt-version: ## which dbt and adapter versions are installed
 	@$(DBT) --version
 
@@ -150,17 +151,33 @@ dbt-test: ## run the tests (ARGS="--select stg_orders")
 dbt-build-all: ## run and test in dependency order
 	@$(DBT) build $(ARGS)
 
+# --- the manifest Airflow reads ---------------------------------------------
+
 # ----------------------------------------------------------------------------
-#  The check that catches a stopped pipeline
+#  Why this is a command of its own
 # ----------------------------------------------------------------------------
-#  When change capture breaks, nothing errors. The topics stop receiving
-#  messages, which looks exactly like an idle database, and every model keeps
-#  building happily from data that stopped moving hours ago.
+#  Cosmos builds its task graph from target/manifest.json at DAG parse time —
+#  every thirty seconds, in the dag-processor. Reading a file costs nothing;
+#  the alternative, LoadMode.DBT_LS, would run `dbt ls` on every parse, which
+#  needs dbt installed in Airflow and a live database connection.
 #
-#  Freshness is measured on source_ts — the timestamp Debezium read from the
-#  source — rather than on when the row arrived here. A replay of a week-old
-#  backlog would look perfectly fresh by arrival time.
+#  The trade is that the manifest can go stale. A model added here and not
+#  followed by `make manifest` simply does not appear in Airflow, with nothing
+#  to say so — the DAG renders perfectly, one task short. The smoke test
+#  compares the two and fails when they disagree.
+#
+#  `dbt parse` rather than `dbt compile`: parse needs no database, so this
+#  works with the warehouse stopped. --network none proves it.
 # ----------------------------------------------------------------------------
+manifest: ## regenerate target/manifest.json so Airflow sees the current graph
+	@docker run --rm --network none -v $(PWD)/project:/dbt $(DBT_IMAGE) dbt parse >/dev/null \
+	  && printf '  manifest written, models in it: ' \
+	  || { echo "  parse failed — run: make dbt-dev CMD=parse"; exit 1; }
+	@python3 -c "import json;print(len([k for k in json.load(open('project/target/manifest.json'))['nodes'] if k.startswith('model.')]))" \
+	  2>/dev/null || echo "?"
+
+# ----------------------------------------------------------------------------
+
 dbt-freshness: ## how old is the newest row in each source
 	@$(DBT) source freshness
 
@@ -185,16 +202,9 @@ models: ## which tables and views dbt has created
 
 # --- documentation ----------------------------------------------------------
 
-# ----------------------------------------------------------------------------
-#  Generated into the volume nginx serves
-# ----------------------------------------------------------------------------
-#  `dbt docs generate` needs a live connection: the catalogue comes from
-#  querying the warehouse for what was actually created, which is what makes
-#  the site show real column types rather than what the models claim.
-#
-#  The output lands in the shared volume rather than in ./project/target, so
-#  the site nginx serves and the files dbt just wrote are the same bytes.
-# ----------------------------------------------------------------------------
+# `dbt docs generate` needs a live connection: the catalogue comes from
+# querying the warehouse for what was actually created, which is what makes
+# the site show real column types rather than what the models claim.
 docs-generate: ## generate the documentation
 	@docker run --rm --network dataplatform $(DBT_ENV) \
 	  -v $(DOCS_VOLUME):/docs-out \
@@ -208,12 +218,7 @@ docs: docs-generate ## generate the documentation and print where to read it
 	@echo ""
 	@echo "  dbt docs  http://localhost:$(DOCS_PORT)"
 	@echo ""
-	@echo "  The lineage graph is the point: click any model to see what it"
-	@echo "  reads and what reads it."
-	@echo ""
 
-# Iterate without rebuilding. The local project is mounted over the one in the
-# image, so an edit to a model takes effect on the next command.
 dbt-dev: ## run a dbt command against the local project (CMD="run --select x")
 	@$(DBT_DEV) $${CMD:-build}
 
@@ -223,8 +228,6 @@ dbt-shell: ## a shell in the dbt image, project mounted
 
 # --- checks -----------------------------------------------------------------
 
-# Half of this runs with no database at all, which is what CI uses. The rest
-# needs ClickHouse and skips without it.
 smoke: ## assert the project parses and, if the warehouse is up, that it builds
 	@./scripts/smoke.sh
 

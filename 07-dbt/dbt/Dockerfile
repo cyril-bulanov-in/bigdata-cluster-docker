@@ -40,7 +40,19 @@ ENV DBT_PROFILES_DIR=/dbt \
 
 COPY project/ /dbt/
 
-# No ENTRYPOINT of its own. The command is always a dbt subcommand, and
-# wrapping it would mean re-exposing every flag dbt already has.
-ENTRYPOINT ["dbt"]
-CMD ["--version"]
+# ----------------------------------------------------------------------------
+#  No ENTRYPOINT, deliberately
+# ----------------------------------------------------------------------------
+#  ENTRYPOINT ["dbt"] is the obvious choice and it breaks Cosmos. Cosmos builds
+#  the full command itself, starting with the word dbt, so the container runs
+#
+#      dbt dbt run --select stg_orders
+#
+#  and fails with `No such command 'dbt'` — which reads as dbt being absent
+#  from an image that plainly contains it.
+#
+#  Leaving the entrypoint alone means every caller passes the whole command.
+#  The Makefile targets do that already; only the bare `docker run` in
+#  `make dbt-version` needed the word added.
+# ----------------------------------------------------------------------------
+CMD ["dbt", "--version"]
