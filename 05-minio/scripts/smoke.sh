@@ -179,21 +179,46 @@ series=$(curl -fsS --max-time 10 --get \
 # the first draft of that file were invented by analogy and did nothing.
 info "Metrics the alerting rules depend on"
 
-for m in minio_cluster_health_status \
-         minio_cluster_capacity_usable_free_bytes \
-         minio_cluster_capacity_usable_total_bytes \
-         minio_cluster_drive_offline_total \
-         minio_s3_requests_errors_total \
-         minio_cluster_usage_object_total \
-         minio_cluster_usage_version_total \
-         minio_node_ilm_expiry_pending_tasks \
-         minio_node_ilm_expiry_missed_tasks \
-         minio_node_ilm_expiry_missed_freeversions; do
-  n=$(curl -fsS --max-time 10 --get --data-urlencode "query=count(${m})" \
-        "${PROM}/api/v1/query" 2>/dev/null | grep -o '"[0-9]*"\]' | head -1 | tr -d '"]' || true)
-  [ -n "${n}" ] \
+# Split in two, because the two groups appear at different times.
+#
+# These are emitted as soon as MinIO starts.
+ALWAYS_PRESENT="minio_cluster_health_status
+minio_cluster_capacity_usable_free_bytes
+minio_cluster_capacity_usable_total_bytes
+minio_cluster_drive_offline_total
+minio_s3_requests_errors_total
+minio_node_ilm_expiry_pending_tasks
+minio_node_ilm_expiry_missed_tasks
+minio_node_ilm_expiry_missed_freeversions"
+
+# These come from the usage scanner, which runs on a schedule rather than at
+# startup. On a freshly created instance with empty buckets they do not exist
+# yet, and their absence says nothing about whether the rules using them are
+# correct — only that nothing has been counted so far.
+#
+# Failing on them made CI red on a clean runner while passing locally, where
+# MinIO had been up for days. Skipped rather than dropped: a rule naming a
+# metric that never appears is still worth catching, just not here.
+AFTER_SCAN="minio_cluster_usage_object_total
+minio_cluster_usage_version_total"
+
+metric_exists() {
+  curl -fsS --max-time 10 --get --data-urlencode "query=count($1)" \
+    "${PROM}/api/v1/query" 2>/dev/null | grep -o '"[0-9]*"\]' | head -1 | tr -d '"]' || true
+}
+
+for m in $ALWAYS_PRESENT; do
+  [ -n "$(metric_exists "$m")" ] \
     && pass "${m}" \
     || fail "${m} does not exist — the rule using it can never fire"
+done
+
+for m in $AFTER_SCAN; do
+  if [ -n "$(metric_exists "$m")" ]; then
+    pass "${m}"
+  else
+    skip "${m} — the usage scanner has not run yet on this instance"
+  fi
 done
 
 # ---------------------------------------------------------------------------

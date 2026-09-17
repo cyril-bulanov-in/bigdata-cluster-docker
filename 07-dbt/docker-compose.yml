@@ -37,14 +37,17 @@ services:
   airflow-dag-processor:
     volumes:
       - ./project:/opt/dbt-project:ro
+      - ./dags/40_dbt_cosmos.py:/opt/airflow/dags/40_dbt_cosmos.py:ro
 
   airflow-scheduler:
     volumes:
       - ./project:/opt/dbt-project:ro
+      - ./dags/40_dbt_cosmos.py:/opt/airflow/dags/40_dbt_cosmos.py:ro
 
   airflow-apiserver:
     volumes:
       - ./project:/opt/dbt-project:ro
+      - ./dags/40_dbt_cosmos.py:/opt/airflow/dags/40_dbt_cosmos.py:ro
 
   # ==========================================================================
   #  The documentation site

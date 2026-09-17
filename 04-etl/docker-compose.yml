@@ -109,7 +109,17 @@ x-airflow: &airflow
     AIRFLOW__CORE__DEFAULT_TIMEZONE: UTC
 
   volumes:
-    - ./dags:/opt/airflow/dags:ro
+    # Not read-only, and the flag was removed rather than never added.
+    #
+    # Airflow never writes here, so :ro looked like free safety. What it
+    # actually did was make the directory impossible to extend: step 7 mounts
+    # its own DAG into this path, and Docker cannot create a mountpoint inside
+    # a read-only mount —
+    #
+    #     make mountpoint ".../dags/40_dbt_cosmos.py": read-only file system
+    #
+    # The flag protected against nothing and blocked something real.
+    - ./dags:/opt/airflow/dags
     - airflow-logs:/opt/airflow/logs
 
   depends_on:
@@ -190,10 +200,18 @@ services:
     <<: *airflow
     container_name: airflow-scheduler
     command: ["scheduler"]
+    # The gid that owns the Docker socket, read from the socket rather than
+    # assumed. A fixed 0 works on Docker Desktop, where the socket inside the
+    # VM is root:root, and grants nothing on a Linux host or a CI runner,
+    # where it is root:docker. See 02-monitoring for the same variable and the
+    # silent failure it prevents there.
     group_add:
-      - "0"
+      - "${DOCKER_GID:-0}"
+    # The anchor's volumes are replaced rather than extended, so this list
+    # repeats them. Compose does not merge a key that a service redefines —
+    # which is why the :ro removal above has to be made here as well.
     volumes:
-      - ./dags:/opt/airflow/dags:ro
+      - ./dags:/opt/airflow/dags
       - airflow-logs:/opt/airflow/logs
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
