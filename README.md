@@ -6,6 +6,7 @@
 [![04-etl](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/04-etl.yml/badge.svg?branch=main)](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/04-etl.yml)
 [![05-minio](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/05-minio.yml/badge.svg?branch=main)](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/05-minio.yml)
 [![06-spark](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/06-spark.yml/badge.svg?branch=main)](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/06-spark.yml)
+[![07-dbt](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/07-dbt.yml/badge.svg?branch=main)](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/07-dbt.yml)
 
 A working data platform, assembled with Docker Compose one component at a time.
 
@@ -36,11 +37,11 @@ application, a dbt project, a Python transformation. The container is a unit of
 delivery, not a way to host a service. Airflow starts it, it does its work,
 it exits.
 
-Steps 4 and 6 make that concrete. The DAGs contain no transformation logic at
-all — they name an image, a schedule and some parameters. Nothing in them even
-says "Spark": the Spark job is an image like any other, which happens to run
-`spark-submit` in its own entrypoint. Moving to EMR Serverless is a change of
-operator rather than a rewrite.
+Steps 4, 6 and 7 make that concrete. The DAGs contain no transformation logic
+at all — they name an image, a schedule and some parameters. Nothing in them
+says "Spark" or "dbt": those are images like any other, which happen to run
+`spark-submit` or `dbt run` in their own entrypoints. Moving to EMR Serverless
+is a change of operator rather than a rewrite.
 
 ### Everything must be portable
 
@@ -57,6 +58,7 @@ environment.
 | Orchestration | Airflow + DockerOperator | same | MWAA + ECS tasks |
 | Object storage | MinIO | MinIO on local disks | S3 |
 | Processing | Spark standalone | Spark standalone | EMR Serverless |
+| Transformation | dbt in a container | same | the same container |
 | Jobs | container images | the same images | the same images |
 
 The job code is identical in all three columns. Only the operator in the DAG
@@ -91,13 +93,15 @@ flowchart LR
 
     API --> K
     OLTP -- CDC --> K
+    OLTP -- direct read --> DBT
     K --> CH
     CH --> S3
     S3 --> SJ
     SJ --> S3
-    S3 --> PY
-    PY --> CH
+    S3 --> DBT
+    CH --> DBT
     DBT --> CH
+    PY --> CH
     CH --> BI
     AF -.starts.-> SJ
     AF -.starts.-> DBT
@@ -108,6 +112,11 @@ flowchart LR
 Solid arrows are data. Dotted arrows are control: the orchestrator starts job
 containers and the monitoring stack scrapes everything, but neither of them
 touches the data itself.
+
+Note that dbt reads all three sources. That is what makes it possible to ask
+whether the warehouse still matches the database it claims to mirror — a
+question most projects cannot answer, because answering it needs a second
+connection nobody set up.
 
 ---
 
@@ -120,9 +129,9 @@ touches the data itself.
 | 03 | [DBMS](03-dbms/) | Postgres, Debezium change capture, ClickHouse cluster of 4 shards x 2 replicas with Keeper, deduplicating staging layer | done |
 | 04 | [ETL](04-etl/) | Airflow 3, DAGs that start job containers, a daily mart, a Parquet export to S3 | done |
 | 05 | [MinIO](05-minio/) | S3-compatible storage, three-layer bucket layout, versioning, lifecycle rules | done |
-| 06 | [Spark](06-spark/) | standalone cluster of 4 workers, S3A with the committer that S3 actually supports, raw to staged | done |
-| 07 | dbt | models over everything accumulated: CDC staging and Spark output | next |
-| 08 | Superset | dashboards on top of the marts | planned |
+| 06 | [Spark](06-spark/) | standalone cluster of 4 workers, S3A with the committer S3 actually supports, raw to staged | done |
+| 07 | [dbt](07-dbt/) | models over all three sources, 50 tests, lineage docs, one Airflow task per model via Cosmos | done |
+| 08 | Superset | dashboards on top of the marts | next |
 
 Ordered so that each step gets its input from the previous one. Monitoring is
 second on purpose: from that point on, every stack arrives with metrics rather
@@ -150,22 +159,23 @@ reschedule; kill the master and watch running jobs carry on regardless. Each
 stack README ends with drills of this kind.
 
 **Failures that leave everything green.** An exporter whose endpoint answers
-while exporting nothing usable. A Kafka consumer subscribed to a topic it will
-never read. A `CREATE ... ON CLUSTER` that succeeds while every distributed
-query fails, because the two use different transports. A distributed JOIN that
-returns a plausible, wrong number because the join key is not the sharding key.
-A DAG that fails to import and is therefore absent rather than broken. A
-versioned bucket quietly keeping every overwrite for ever. A Spark job that
-writes `_SUCCESS` into an empty prefix because its committer staged the data
-somewhere the driver could not see. An alerting rule naming a metric that does
-not exist, which never fires and never complains. These are what the smoke
-tests exist for.
+while exporting nothing usable. A `CREATE ... ON CLUSTER` that succeeds while
+every distributed query fails, because the two use different transports. A
+distributed JOIN that returns a plausible, wrong number because the join key is
+not the sharding key. A DAG that fails to import and is therefore absent rather
+than broken. A versioned bucket quietly keeping every overwrite for ever. A
+Spark job that writes `_SUCCESS` into an empty prefix because its committer
+staged the data somewhere the driver could not see. A dbt mart that counted
+cancelled orders as revenue for two steps, verified its own output, and was
+believed. An alerting rule naming a metric that does not exist, which never
+fires and never complains. These are what the smoke tests exist for.
 
 **Correctness under change.** Deduplicating a stream of inserts, updates and
 deletes so readers see one current row. Why the version column must be a log
 position and not a timestamp. Why partitioning by a mutable column silently
 breaks deduplication forever. Why overwriting one partition in S3 needs more
-care than it looks, and how a re-run of one day can delete a month.
+care than it looks, and how a re-run of one day can delete a month. Why a
+calendar day ending is not the same as its data being final.
 
 **Operational habits.** Pinned image versions, health checks that mean
 something, resource limits, credentials outside version control, one-command
@@ -176,11 +186,12 @@ teardown and rebuild from scratch.
 ## Getting started
 
 Each stack runs independently and pulls in what it needs through Compose
-`include`. Starting step 6 starts all six.
+`include`. Starting step 7 starts all seven.
 
 ```bash
-cd 06-spark
+cd 07-dbt
 cp .env.example .env
+cp ../06-spark/.env.example ../06-spark/.env
 cp ../05-minio/.env.example ../05-minio/.env
 cp ../04-etl/.env.example ../04-etl/.env
 cp ../03-dbms/.env.example ../03-dbms/.env
@@ -212,8 +223,9 @@ bigdata-cluster-docker/
     ├── .env.example       configuration template, copy to .env
     ├── Makefile           up / down / logs / test / stack-specific helpers
     ├── scripts/smoke.sh   assertions about the running stack
-    ├── dags/              scheduling only, no logic          (04-etl)
-    └── jobs/              the work, as versioned images      (04-etl, 06-spark)
+    ├── dags/              scheduling only, no logic     (04-etl, 07-dbt)
+    ├── jobs/              the work, as versioned images (04-etl, 06-spark)
+    └── project/           the dbt project               (07-dbt)
 ```
 
 ---
@@ -226,10 +238,11 @@ service name, never by IP address.
 
 **Nothing runs as `latest`.** Every image tag is pinned in `.env.example`, and
 pinned from the **registry** rather than from the project's source releases —
-the two are not always in step, and MinIO is the current example: its public
-images stop months behind its releases. The same rule applies to jars: their
-versions are fixed by what they must match, not chosen, and the Spark image
-build opens each one to confirm the class it is supposed to contain.
+the two are not always in step, and the registry itself can move: MinIO now
+publishes to quay.io and its Docker Hub copies are missing tags entirely. The
+same rule applies to jars: their versions are fixed by what they must match,
+not chosen, and the Spark image build opens each one to confirm the class it is
+supposed to contain.
 
 **Configuration through `.env`.** Secrets and machine-specific values stay out
 of the repository. Each stack ships a documented `.env.example`, and `make up`
@@ -242,13 +255,21 @@ container labels, and no stack has to edit the monitoring configuration to be
 seen.
 
 **Jobs are images, not code in the orchestrator.** `dags/` decides when and
-with what parameters; `jobs/` does the work. The two never mix, which is what
-keeps a job a versioned artifact that runs unchanged anywhere.
+with what parameters; `jobs/` and `project/` do the work. The two never mix,
+which is what keeps a job a versioned artifact that runs unchanged anywhere —
+and it is why step 7 runs dbt in containers rather than inside the scheduler,
+at the cost of a container start per model.
+
+**A DAG lives in the stack that provides what it needs.** Step 7's DAG sits in
+`07-dbt/dags/` rather than beside the others, because it reads a manifest only
+that stack produces. In `04-etl` it was a DAG that could not be parsed, and its
+CI failed on a file it had no way to satisfy.
 
 **Comments explain the why.** Compose files are written for someone who knows
-what a container is but has not memorised Kafka listener semantics or S3A
-committer behaviour. Where a setting exists to avoid a specific failure, the
-comment says which one — often with the exact error message it produces.
+what a container is but has not memorised Kafka listener semantics, S3A
+committer behaviour or ClickHouse deduplication rules. Where a setting exists
+to avoid a specific failure, the comment says which one — often with the exact
+error message it produces.
 
 **A `Makefile` per stack.** Standard targets everywhere: `up`, `down`, `clean`,
 `ps`, `logs`, `config`, `smoke`, `test`. Run `make` on its own for the full
@@ -260,9 +281,11 @@ stack that a successful start does not prove. GitHub Actions runs both on every
 change, on a clean runner, from an empty state.
 
 Where CI cannot cover something, the stack README says so and gives the
-commands that do. Steps 3 to 6 are the current examples: eight ClickHouse nodes
+commands that do. Steps 3 to 7 are the current examples: eight ClickHouse nodes
 do not fit on a GitHub runner, so those workflows start everything else and the
-skipped assertions print as `SKIP` rather than quietly disappearing.
+skipped assertions print as `SKIP` rather than quietly disappearing. Step 7 is
+the extreme case — dbt does nothing without a warehouse, so its workflow checks
+parsing and the manifest and says so plainly.
 
 ---
 
