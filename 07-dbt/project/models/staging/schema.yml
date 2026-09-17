@@ -38,8 +38,9 @@ models:
           # than error, because that is a fact about the data and not a defect
           # in this model.
           - relationships:
-              to: ref('stg_customers')
-              field: customer_id
+              arguments:
+                to: ref('stg_customers')
+                field: customer_id
               config:
                 severity: warn
 
@@ -47,11 +48,17 @@ models:
         description: Where the order is in its lifecycle.
         data_tests:
           - not_null
+          # `arguments` rather than the test's options sitting directly under
+          # its name. The older form still works and warns with
+          # MissingArgumentsPropertyInGenericTestDeprecation; it stops working
+          # in the next major version, and a deprecation warning is easy to
+          # ignore for exactly as long as it takes to become an error.
           - accepted_values:
-              # Written out rather than left open so that a new status added
-              # upstream shows up here as a failing test instead of appearing
-              # unannounced in a dashboard.
-              values: ['pending', 'paid', 'shipped', 'delivered', 'cancelled']
+              arguments:
+                # Written out rather than left open so that a new status added
+                # upstream shows up here as a failing test instead of
+                # appearing unannounced in a dashboard.
+                values: ['pending', 'paid', 'shipped', 'delivered', 'cancelled']
 
       - name: total_amount
         description: Order total, as a Decimal carried unchanged from Postgres.
@@ -74,8 +81,9 @@ models:
         data_tests:
           - not_null
           - relationships:
-              to: ref('stg_orders')
-              field: order_id
+              arguments:
+                to: ref('stg_orders')
+                field: order_id
               config:
                 # Also a warning, and for a subtler reason than above: an item
                 # can arrive before its order. Both come through Kafka on
@@ -88,8 +96,9 @@ models:
         data_tests:
           - not_null
           - relationships:
-              to: ref('stg_products')
-              field: product_id
+              arguments:
+                to: ref('stg_products')
+                field: product_id
               config:
                 severity: warn
 

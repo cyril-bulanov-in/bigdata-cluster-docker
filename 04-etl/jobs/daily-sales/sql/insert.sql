@@ -1,60 +1,52 @@
--- Recompute one day of sales by category.
+-- Recompute one day of the mart.
 --
--- {day:Date} is a real query parameter, not string interpolation. ClickHouse
--- parses it as a Date and rejects anything that is not one, which is the
--- difference between a bad parameter failing here and a bad parameter
--- silently selecting nothing.
+-- Idempotent: the target is a ReplacingMergeTree versioned by computed_at, so
+-- re-running a day replaces its rows rather than adding to them.
 
-INSERT INTO analytics.daily_sales_by_category
+INSERT INTO daily_sales_by_category
 SELECT
-    toDate(o.created_at)                        AS day,
-    p.category                                  AS category,
-    uniqExact(o.order_id)                       AS orders,
-    sum(oi.quantity)                            AS items,
-    sum(oi.quantity * oi.unit_price)            AS revenue,
-    now64(3)                                    AS computed_at
-FROM
-(
-    -- FINAL collapses the versions change capture produces: an order arrives
-    -- as an insert, then an update setting the total, then once per status
-    -- change. Without FINAL every one of those would be counted.
-    --
-    -- It is expensive — it merges parts at read time — which is exactly why
-    -- this runs once a day into a small table instead of on every dashboard
-    -- refresh.
-    SELECT order_id, created_at, status
-    FROM analytics.orders FINAL
-    WHERE is_deleted = 0
-      AND toDate(created_at) = {day:Date}
-      -- Cancelled orders are not sales. Everything else counts, including
-      -- orders still in flight, because the question is what was ordered that
-      -- day, not what was eventually delivered.
-      AND status != 'cancelled'
-) AS o
-INNER JOIN
-(
-    SELECT order_id, product_id, quantity, unit_price
-    FROM analytics.order_items FINAL
-    WHERE is_deleted = 0
-) AS oi
-    -- A plain JOIN, and it is correct here only because both tables are
-    -- sharded on order_id. A distributed JOIN runs locally on each shard, so
-    -- co-located keys join correctly and anything else silently loses the
-    -- rows whose partners live on another node.
-    ON o.order_id = oi.order_id
-GLOBAL INNER JOIN
-(
-    SELECT product_id, category
-    FROM analytics.products FINAL
-    WHERE is_deleted = 0
-) AS p
-    -- GLOBAL, because products is sharded on product_id, not order_id. Its
-    -- rows for a given order can live on any shard.
-    --
-    -- GLOBAL makes the initiator evaluate this subquery once and send the
-    -- result to every shard. Dropping the keyword would not raise an error:
-    -- each shard would join against only its own slice of products, and the
-    -- output would be quietly short. That is the failure mode worth
-    -- remembering — a wrong number, not a stack trace.
-    ON oi.product_id = p.product_id
-GROUP BY day, category;
+    toDate(o.created_at)            AS day,
+    p.category                      AS category,
+    uniqExact(o.order_id)           AS orders,
+    sum(i.quantity)                 AS items,
+    sum(i.quantity * i.unit_price)  AS revenue,
+    now()                           AS computed_at
+FROM order_items AS i
+INNER JOIN orders AS o
+    ON o.order_id = i.order_id
+-- ---------------------------------------------------------------------------
+--  GLOBAL, and only here
+-- ---------------------------------------------------------------------------
+--  orders and order_items are both sharded on order_id, so their rows sit on
+--  the same node and a plain JOIN is correct.
+--
+--  products is sharded on product_id. A plain JOIN would run on each shard
+--  against whatever fragment of the catalogue happens to live there, and
+--  silently drop every line whose product is elsewhere. GLOBAL sends the
+--  whole catalogue to every node first.
+--
+--  The failure this prevents is not an error. It is a smaller number.
+-- ---------------------------------------------------------------------------
+GLOBAL INNER JOIN products AS p
+    ON p.product_id = i.product_id
+WHERE toDate(o.created_at) = {day:Date}
+  AND o.is_deleted = 0
+  AND i.is_deleted = 0
+-- ---------------------------------------------------------------------------
+--  Cancelled orders are not revenue
+-- ---------------------------------------------------------------------------
+--  Added after the dbt model in 07-dbt disagreed with this job by about one
+--  percent on every closed day. The dbt model excluded cancelled orders and
+--  this one did not, so this one was overstating revenue for every day it had
+--  ever computed.
+--
+--  Nothing caught it for two steps. The job verified that it wrote rows and
+--  that the count was plausible, which it was — an order that is placed and
+--  then cancelled is a real order, and counting it produces a number that
+--  looks entirely reasonable and is wrong.
+--
+--  What caught it was a second implementation of the same definition,
+--  disagreeing. That is the argument for keeping both.
+-- ---------------------------------------------------------------------------
+  AND o.status != 'cancelled'
+GROUP BY day, category

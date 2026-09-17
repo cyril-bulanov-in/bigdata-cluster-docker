@@ -1,0 +1,103 @@
+# ============================================================================
+#  Marts
+# ============================================================================
+#  Goes in models/marts/. The other schema.yml, with the four stg_* models,
+#  belongs in models/staging/ — dbt reads both, and a model described in the
+#  wrong file produces "model not found" for the one and "unused config" for
+#  the other.
+# ============================================================================
+
+version: 2
+
+models:
+
+  - name: recon_orders_by_source
+    description: >
+      One row per day, comparing order counts and revenue across the three
+      routes the same facts travel: the operational Postgres read directly,
+      the CDC staging layer in ClickHouse, and the Parquet Spark wrote to
+      object storage.
+
+      The only model in the project that checks the warehouse against its
+      source rather than against itself.
+    columns:
+      - name: order_date
+        data_tests:
+          - unique
+          - not_null
+
+      - name: verdict
+        description: >
+          exact, within tolerance, missing from warehouse, not in source, or
+          DIVERGED.
+        data_tests:
+          - not_null
+          # `arguments` rather than the options sitting directly under the
+          # test name. The older form still works and warns with
+          # MissingArgumentsPropertyInGenericTestDeprecation; it stops working
+          # in the next major version, and a deprecation warning is easy to
+          # ignore for exactly as long as it takes to become an error.
+          - accepted_values:
+              arguments:
+                values: ['exact', 'within tolerance', 'missing from warehouse', 'not in source', 'DIVERGED']
+
+      - name: cdc_minus_pg
+        description: >
+          Signed. Negative means the warehouse is behind the source; positive
+          means it holds more rows than exist, which is the worse case.
+
+  - name: daily_sales_by_category
+    description: >
+      Revenue per day and category, excluding cancelled orders.
+
+      The same mart the job in 04-etl computes. Both are kept on purpose: they
+      read the same rows and must agree, so comparing them checks that this
+      project reproduces the hand-written pipeline rather than merely
+      resembling it.
+
+      That comparison has already earned its place — it found the job counting
+      cancelled orders as revenue, which nothing else had noticed in two
+      steps.
+    columns:
+      - name: day
+        data_tests:
+          - not_null
+
+      - name: category
+        data_tests:
+          - not_null
+
+      - name: orders
+        description: Distinct orders contributing to this day and category.
+        data_tests:
+          - not_null
+
+      - name: revenue
+        description: Excludes cancelled orders.
+        data_tests:
+          - not_null
+
+  - name: customer_order_summary
+    description: >
+      One row per customer with their order history. Customers who have never
+      ordered appear with zeros — a left join, because "what have our
+      customers bought" and "what have our buyers bought" are different
+      questions and the difference is the group most worth looking at.
+    columns:
+      - name: customer_id
+        data_tests:
+          - unique
+          - not_null
+
+      - name: country_code
+        data_tests:
+          - not_null
+
+      - name: orders_placed
+        data_tests:
+          - not_null
+
+      - name: lifetime_value
+        description: Excludes cancelled orders; the counts above include them.
+        data_tests:
+          - not_null

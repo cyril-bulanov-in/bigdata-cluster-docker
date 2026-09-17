@@ -1,0 +1,65 @@
+# ============================================================================
+#  The two sources that are not ClickHouse
+# ============================================================================
+#  Tested more lightly than the CDC models, and for a reason: every test here
+#  is a query against another system. A `unique` test on stg_pg_orders scans
+#  the operational database, and a test suite that hammers production to prove
+#  production is fine is a bad trade.
+#
+#  So: structural assertions only, and the expensive comparisons live in the
+#  reconciliation marts where they run on a schedule rather than on every
+#  `dbt test`.
+# ============================================================================
+
+version: 2
+
+models:
+
+  - name: stg_s3_orders
+    description: >
+      Orders as Spark wrote them to object storage. The same facts as
+      stg_orders, arrived by a different route.
+    columns:
+      - name: order_id
+        data_tests:
+          - unique
+          - not_null
+
+      - name: dt
+        description: >
+          The partition date, recovered from the object key rather than read
+          from the file. ClickHouse does not derive Hive-style partition
+          columns the way Spark does.
+        data_tests:
+          # The test that catches a broken path regex. extractGroups returns
+          # an empty array when it does not match, and toDate of that is null
+          # — so a subtly wrong expression yields a column full of nulls
+          # rather than an error, and the model looks like it has missing data.
+          - not_null
+
+      - name: total_amount
+        data_tests:
+          - not_null
+
+  - name: stg_pg_orders
+    description: >
+      Orders read directly from the operational Postgres, bypassing change
+      capture. The control against which the warehouse is checked.
+    columns:
+      - name: order_id
+        data_tests:
+          - not_null
+      - name: status
+        data_tests:
+          - not_null
+
+  - name: stg_pg_customers
+    description: >
+      Customers read directly from the operational Postgres.
+    columns:
+      - name: customer_id
+        data_tests:
+          - not_null
+      - name: email
+        data_tests:
+          - not_null
