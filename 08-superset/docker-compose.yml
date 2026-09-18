@@ -1,10 +1,10 @@
 # ============================================================================
-#  PLATFORM — step 8: dashboards (part 1 — Superset itself)
+#  PLATFORM — step 8: dashboards
 # ============================================================================
 #
-#  Superset with its own metadata database and a Redis for caching. No
-#  connection to the warehouse yet, and no dashboards: this part is about
-#  getting it running and reporting.
+#  Superset with its own metadata database, a Redis for caching, and a
+#  connection to the warehouse registered from a script rather than clicked
+#  into the UI.
 #
 #  Start:  make up
 #  UI:     http://localhost:8089
@@ -81,12 +81,18 @@ services:
       start_period: 5s
 
   # ==========================================================================
-  #  One-shot: migrate the schema and create the admin
+  #  One-shot: migrate, create the admin, register the connection
   # ==========================================================================
-  #  Three commands that must run in order and must run before the web
-  #  process. `superset init` is the one people miss: it creates the default
-  #  roles and permissions, and without it the UI loads and every page is
-  #  forbidden — an authenticated admin with no rights to anything.
+  #  Four steps that must run in order and must finish before the web process.
+  #
+  #  `superset init` is the one people miss: it creates the default roles and
+  #  permissions, and without it the UI loads, login succeeds, and every page
+  #  is forbidden — an authenticated admin with rights to nothing.
+  #
+  #  The connection comes last, because it needs the schema and the roles to
+  #  exist. It is registered on every start rather than once: the command is
+  #  idempotent, so this costs nothing and means a fresh volume comes back
+  #  with the warehouse already connected.
   # ==========================================================================
   superset-init:
     build:
@@ -108,8 +114,17 @@ services:
       # rather than reading a path, so the directory goes on PYTHONPATH and
       # the file has to be named exactly this.
       PYTHONPATH: /app/pythonpath
+      # Read by provision.sh to assemble the connection URI. The password
+      # never appears in a committed file.
+      SUPERSET_CLICKHOUSE_NAME: ${SUPERSET_CLICKHOUSE_NAME}
+      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST}
+      CLICKHOUSE_PORT: ${CLICKHOUSE_PORT}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_MARTS_DB: ${CLICKHOUSE_MARTS_DB}
     volumes: &superset-volumes
       - ./superset/superset_config.py:/app/pythonpath/superset_config.py:ro
+      - ./superset/provision.sh:/app/provision.sh:ro
     command:
       - /bin/sh
       - -c
@@ -122,6 +137,7 @@ services:
           --email "${SUPERSET_ADMIN_EMAIL}" \
           --password "${SUPERSET_ADMIN_PASSWORD}" || true
         superset init
+        sh /app/provision.sh
     depends_on:
       superset-postgres:
         condition: service_healthy
