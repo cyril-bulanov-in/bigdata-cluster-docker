@@ -13,10 +13,9 @@
 #   the warehouse connection registered but pointing at the native port, which
 #     hangs rather than failing
 #   a dataset attached to a database that does not exist — the state Superset's
-#     documented YAML import produces silently, and the reason datasets.py
-#     looks the database up by name instead
-#   /health answering before the application has finished loading, which it
-#     does, so a healthy container proves less than it looks
+#     documented YAML import produces silently
+#   a dashboard with no position_json, which renders every chart stacked in one
+#     column and looks like a styling problem
 #
 # Usage:  ./scripts/smoke.sh          (or: make smoke)
 
@@ -48,6 +47,8 @@ IMAGE="dataplatform/superset:${SUPERSET_VERSION}"
 SUPERSET="http://localhost:${SUPERSET_PORT}"
 
 EXPECTED_DATASETS="daily_sales_by_category customer_order_summary recon_orders_by_source"
+DASHBOARD_SLUG="platform-overview"
+EXPECTED_CHARTS=8
 
 # The virtualenv Superset actually runs from. Not a detail: a package
 # installed with the system pip lands outside it and is invisible to the
@@ -90,9 +91,6 @@ for mod in psycopg2 clickhouse_connect; do
   fi
 done
 
-# Importable is not the same as registered. A driver that imports cleanly
-# while failing to register produces an error about an unknown dialect when
-# the connection is used — several steps away from the cause.
 if docker run --rm --entrypoint "$VENV_PY" "$IMAGE" -c \
      "import clickhouse_connect.cc_sqlalchemy" >/dev/null 2>&1; then
   pass "the clickhousedb:// dialect registers"
@@ -137,8 +135,6 @@ tables=$(pg "SELECT count(*) FROM information_schema.tables WHERE table_schema =
   && pass "${tables} tables in Postgres — the migration ran against the right database" \
   || fail "${tables:-0} tables in Postgres, expected at least 20 — did Superset fall back to SQLite?"
 
-# `superset init` creates the default roles. Without it the UI loads, login
-# succeeds, and every page is forbidden.
 roles=$(pg "SELECT count(*) FROM ab_role")
 [ "${roles:-0}" -ge 4 ] 2>/dev/null \
   && pass "${roles} roles exist — superset init ran" \
@@ -153,8 +149,7 @@ admins=$(pg "SELECT count(*) FROM ab_user WHERE username = '${ADMIN_USER}'")
 #  4. The warehouse connection
 # ---------------------------------------------------------------------------
 #  Registered by register.sh on every start, so a fresh volume comes back with
-#  it rather than waiting for someone to click it in. A connection that exists
-#  only in a browser is not part of the project.
+#  it rather than waiting for someone to click it in.
 #
 #  Checked even without a warehouse: registering the URI is writing a string,
 #  and needs nobody to be listening.
@@ -193,8 +188,7 @@ fi
 #  datasets.py asks ClickHouse what columns each mart has, because a
 #  hand-written column list drifts the moment a model changes. So it cannot
 #  run where the warehouse is absent, and SUPERSET_SKIP_DATASETS=1 says that
-#  was a decision rather than a failure. CI sets it; these checks then skip
-#  instead of failing on something they were never given.
+#  was a decision rather than a failure.
 # ---------------------------------------------------------------------------
 info "The datasets"
 
@@ -269,7 +263,57 @@ with app.app_context():
 fi
 
 # ---------------------------------------------------------------------------
-#  6. The application
+#  6. The dashboard
+# ---------------------------------------------------------------------------
+#  Built by dashboard.py from code rather than imported from an exported
+#  bundle, so these checks are about what goes wrong when a layout is written
+#  by hand.
+#
+#  A position_json whose `parents` lists are wrong loads with every chart
+#  stacked in a heap, and a layout referencing a chart that was never created
+#  leaves a gap where a panel should be. Neither raises.
+# ---------------------------------------------------------------------------
+info "The dashboard"
+
+if [ "$SKIP_DATASETS" = "1" ]; then
+  skip "the dashboard — it needs the datasets, which were not registered"
+  skip "its charts — the dashboard was not built"
+  skip "its layout — the dashboard was not built"
+else
+  dash=$(pg "SELECT count(*) FROM dashboards WHERE slug = '${DASHBOARD_SLUG}'")
+  [ "${dash:-0}" -ge 1 ] 2>/dev/null \
+    && pass "the '${DASHBOARD_SLUG}' dashboard exists" \
+    || fail "no dashboard with slug '${DASHBOARD_SLUG}' — check: docker compose logs superset-init"
+
+  charts=$(pg "SELECT count(*) FROM slices")
+  [ "${charts:-0}" -ge "$EXPECTED_CHARTS" ] 2>/dev/null \
+    && pass "${charts} charts exist" \
+    || fail "${charts:-0} charts, expected at least ${EXPECTED_CHARTS}"
+
+  # Attached, not merely existing. A chart created but left off the dashboard
+  # is invisible, and one the layout names but never created leaves a gap.
+  attached=$(pg "SELECT count(*) FROM dashboard_slices ds JOIN dashboards d ON d.id = ds.dashboard_id WHERE d.slug = '${DASHBOARD_SLUG}'")
+  [ "${attached:-0}" -ge "$EXPECTED_CHARTS" ] 2>/dev/null \
+    && pass "${attached} charts attached to the dashboard" \
+    || fail "${attached:-0} charts attached, expected ${EXPECTED_CHARTS}"
+
+  # The same dangling check as for datasets, one level up.
+  orphans=$(pg "SELECT count(*) FROM slices s LEFT JOIN tables t ON t.id = s.datasource_id WHERE s.datasource_type = 'table' AND t.id IS NULL")
+  [ "${orphans:-1}" = "0" ] \
+    && pass "no chart points at a missing dataset" \
+    || fail "${orphans} chart(s) attached to a dataset that does not exist"
+
+  # position_json is what makes the layout a layout. Superset renders a
+  # dashboard without one, stacking every chart in a single column — which
+  # looks like a styling problem rather than a missing field.
+  layout=$(pg "SELECT length(position_json) FROM dashboards WHERE slug = '${DASHBOARD_SLUG}'")
+  [ "${layout:-0}" -gt 100 ] 2>/dev/null \
+    && pass "the dashboard has a layout (${layout} bytes of position_json)" \
+    || fail "position_json is ${layout:-empty} — the charts would stack in one column"
+fi
+
+# ---------------------------------------------------------------------------
+#  7. The application
 # ---------------------------------------------------------------------------
 #  /health answers before Superset has finished loading its metadata, so a
 #  healthy container says the process is alive and nothing more. The login
@@ -300,7 +344,7 @@ printf '%s' "$version_out" | grep -q "${SUPERSET_VERSION%%.*}" \
   || fail "Superset did not report version ${SUPERSET_VERSION}: ${version_out:-nothing}"
 
 # ---------------------------------------------------------------------------
-#  7. Caching
+#  8. Caching
 # ---------------------------------------------------------------------------
 #  Not decoration. Without a backing store Superset keeps dashboard filter
 #  state in the metadata database, and the UI grows slower with every

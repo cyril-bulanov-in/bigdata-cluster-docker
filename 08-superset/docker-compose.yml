@@ -138,6 +138,7 @@ services:
       - ./superset/superset_config.py:/app/pythonpath/superset_config.py:ro
       - ./superset/register.sh:/app/register.sh:ro
       - ./superset/datasets.py:/app/datasets.py:ro
+      - ./superset/dashboard.py:/app/dashboard.py:ro
     command:
       - /bin/sh
       - -c

@@ -1,10 +1,12 @@
 #!/usr/bin/env sh
 #
-# Registers the warehouse connection and the datasets over it.
+# Registers everything Superset needs to be useful on a fresh volume: the
+# warehouse connection, the datasets over it, and the dashboard on top.
 #
-# Both are idempotent, so this runs on every start: a fresh volume comes back
-# with the warehouse connected and its marts already registered, rather than
-# waiting for someone to click them in.
+# All three are idempotent, so this runs on every start. A fresh `make clean`
+# comes back with the platform connected and its dashboard built, rather than
+# waiting for someone to click it in — which is the whole point: a dashboard
+# that exists only in a browser is not part of the project.
 #
 # ---------------------------------------------------------------------------
 #  SUPERSET_SKIP_DATASETS
@@ -12,15 +14,16 @@
 #  The connection is a string; registering it needs nobody to be listening.
 #  The datasets are not: datasets.py asks ClickHouse what columns each mart
 #  has, because a hand-written column list drifts the moment a model changes.
+#  The dashboard in turn needs the datasets.
 #
 #  So on a machine without the warehouse — the CI runner, which starts only
-#  the three Superset services — the dataset step cannot work:
+#  the three Superset services — both steps fail on name resolution:
 #
 #      Failed to resolve 'clickhouse-01' ... Temporary failure in name resolution
 #
-#  Set SUPERSET_SKIP_DATASETS=1 there. The step is then deliberately not run
-#  and says so, rather than being wrapped in a `|| true` that would swallow a
-#  real failure just as quietly.
+#  Set SUPERSET_SKIP_DATASETS=1 there. They are then deliberately not run and
+#  say so, rather than being wrapped in a `|| true` that would swallow a real
+#  failure just as quietly.
 #
 #  That distinction — could not, versus chose not to — is the same one the
 #  smoke tests make by printing SKIP instead of nothing.
@@ -64,12 +67,16 @@ echo "registering connection '${DB_NAME}' -> clickhousedb://${CH_USER}@${CH_HOST
 superset set-database-uri --database_name "${DB_NAME}" --uri "${URI}"
 
 if [ "${SUPERSET_SKIP_DATASETS:-0}" = "1" ]; then
-  echo "datasets: SKIPPED (SUPERSET_SKIP_DATASETS=1 — no warehouse to read columns from)"
+  echo "datasets:  SKIPPED (SUPERSET_SKIP_DATASETS=1 — no warehouse to read columns from)"
+  echo "dashboard: SKIPPED (it needs the datasets)"
   exit 0
 fi
 
-echo "registering datasets"
 # Through the venv's interpreter explicitly. `python` alone resolves to it
 # today and need not tomorrow, and the whole class of failure this image has
 # already produced is code running under the wrong interpreter.
+echo "registering datasets"
 /app/.venv/bin/python /app/datasets.py
+
+echo "building the dashboard"
+/app/.venv/bin/python /app/dashboard.py
