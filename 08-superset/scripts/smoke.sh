@@ -12,9 +12,9 @@
 #     and Superset fell back to its default
 #   the warehouse connection registered but pointing at the native port, which
 #     hangs rather than failing
-#   a dataset attached to a database that does not exist — the state the YAML
-#     import path produces silently, and the reason datasets.py looks the
-#     database up by name instead
+#   a dataset attached to a database that does not exist — the state Superset's
+#     documented YAML import produces silently, and the reason datasets.py
+#     looks the database up by name instead
 #   /health answering before the application has finished loading, which it
 #     does, so a healthy container proves less than it looks
 #
@@ -37,6 +37,12 @@ DB_NAME="$(read_env SUPERSET_DB_NAME .env)";          DB_NAME="${DB_NAME:-supers
 DB_USER="$(read_env SUPERSET_DB_USER .env)";          DB_USER="${DB_USER:-superset}"
 CH_NAME="$(read_env SUPERSET_CLICKHOUSE_NAME .env)";  CH_NAME="${CH_NAME:-ClickHouse marts}"
 CH_MARTS="$(read_env CLICKHOUSE_MARTS_DB .env)";      CH_MARTS="${CH_MARTS:-marts_marts}"
+
+# Set where there is no warehouse to read columns from. The environment wins
+# over the file, because CI sets it as a job-level variable rather than
+# editing .env.
+SKIP_DATASETS="${SUPERSET_SKIP_DATASETS:-$(read_env SUPERSET_SKIP_DATASETS .env)}"
+SKIP_DATASETS="${SKIP_DATASETS:-0}"
 
 IMAGE="dataplatform/superset:${SUPERSET_VERSION}"
 SUPERSET="http://localhost:${SUPERSET_PORT}"
@@ -73,6 +79,9 @@ else
   exit 1
 fi
 
+# Imported through the venv's interpreter explicitly. `python -c` alone would
+# use whatever is first on the path — and the whole class of failure this
+# guards against is a package reachable from one interpreter and not the other.
 for mod in psycopg2 clickhouse_connect; do
   if docker run --rm --entrypoint "$VENV_PY" "$IMAGE" -c "import ${mod}" >/dev/null 2>&1; then
     pass "${mod} is importable from ${VENV_PY}"
@@ -81,6 +90,9 @@ for mod in psycopg2 clickhouse_connect; do
   fi
 done
 
+# Importable is not the same as registered. A driver that imports cleanly
+# while failing to register produces an error about an unknown dialect when
+# the connection is used — several steps away from the cause.
 if docker run --rm --entrypoint "$VENV_PY" "$IMAGE" -c \
      "import clickhouse_connect.cc_sqlalchemy" >/dev/null 2>&1; then
   pass "the clickhousedb:// dialect registers"
@@ -125,6 +137,8 @@ tables=$(pg "SELECT count(*) FROM information_schema.tables WHERE table_schema =
   && pass "${tables} tables in Postgres — the migration ran against the right database" \
   || fail "${tables:-0} tables in Postgres, expected at least 20 — did Superset fall back to SQLite?"
 
+# `superset init` creates the default roles. Without it the UI loads, login
+# succeeds, and every page is forbidden.
 roles=$(pg "SELECT count(*) FROM ab_role")
 [ "${roles:-0}" -ge 4 ] 2>/dev/null \
   && pass "${roles} roles exist — superset init ran" \
@@ -137,6 +151,13 @@ admins=$(pg "SELECT count(*) FROM ab_user WHERE username = '${ADMIN_USER}'")
 
 # ---------------------------------------------------------------------------
 #  4. The warehouse connection
+# ---------------------------------------------------------------------------
+#  Registered by register.sh on every start, so a fresh volume comes back with
+#  it rather than waiting for someone to click it in. A connection that exists
+#  only in a browser is not part of the project.
+#
+#  Checked even without a warehouse: registering the URI is writing a string,
+#  and needs nobody to be listening.
 # ---------------------------------------------------------------------------
 info "The warehouse connection"
 
@@ -167,48 +188,54 @@ fi
 # ---------------------------------------------------------------------------
 #  5. The datasets
 # ---------------------------------------------------------------------------
-#  Registered by datasets.py on every start, so a fresh volume comes back with
-#  them. A dataset created in the UI is not part of the project and does not
-#  survive `make clean`.
+#  Registered from a file, or deliberately not.
 #
-#  The dangling-dataset check is the one worth having. Superset's documented
-#  YAML import links a dataset to its database by UUID, and a bundle exported
-#  from one installation points at a UUID that does not exist in another — the
-#  import succeeds and produces datasets attached to nothing, which shows up
-#  only when someone opens a chart.
+#  datasets.py asks ClickHouse what columns each mart has, because a
+#  hand-written column list drifts the moment a model changes. So it cannot
+#  run where the warehouse is absent, and SUPERSET_SKIP_DATASETS=1 says that
+#  was a decision rather than a failure. CI sets it; these checks then skip
+#  instead of failing on something they were never given.
 # ---------------------------------------------------------------------------
 info "The datasets"
 
-for ds in $EXPECTED_DATASETS; do
-  n=$(pg "SELECT count(*) FROM tables WHERE table_name = '${ds}'")
-  [ "${n:-0}" -ge 1 ] 2>/dev/null \
-    && pass "dataset ${ds} is registered" \
-    || fail "dataset ${ds} is missing — check: docker compose logs superset-init"
-done
+if [ "$SKIP_DATASETS" = "1" ]; then
+  skip "datasets — SUPERSET_SKIP_DATASETS is set, no warehouse to read columns from"
+  skip "dataset columns — datasets were not registered"
+  skip "dataset metrics — datasets were not registered"
+else
+  for ds in $EXPECTED_DATASETS; do
+    n=$(pg "SELECT count(*) FROM tables WHERE table_name = '${ds}'")
+    [ "${n:-0}" -ge 1 ] 2>/dev/null \
+      && pass "dataset ${ds} is registered" \
+      || fail "dataset ${ds} is missing — check: docker compose logs superset-init"
+  done
 
-# Every dataset must point at a database that exists.
+  # Columns are fetched from ClickHouse rather than declared, so a dataset
+  # with none means fetch_metadata() failed quietly — the dataset exists and
+  # every chart built on it will have nothing to select.
+  for ds in $EXPECTED_DATASETS; do
+    cols=$(pg "SELECT count(*) FROM table_columns c JOIN tables t ON t.id = c.table_id WHERE t.table_name = '${ds}'")
+    [ "${cols:-0}" -ge 3 ] 2>/dev/null \
+      && pass "${ds} has ${cols} columns" \
+      || fail "${ds} has ${cols:-0} columns — fetch_metadata() found nothing"
+  done
+
+  # Metrics defined on the dataset rather than in individual charts. Two
+  # charts that each define "revenue" will eventually disagree; one definition
+  # on the dataset is inherited by every chart.
+  metrics=$(pg "SELECT count(*) FROM sql_metrics m JOIN tables t ON t.id = m.table_id WHERE t.table_name IN ('daily_sales_by_category','customer_order_summary','recon_orders_by_source')")
+  [ "${metrics:-0}" -ge 9 ] 2>/dev/null \
+    && pass "${metrics} metrics defined on the datasets" \
+    || fail "${metrics:-0} metrics, expected at least 9"
+fi
+
+# Every dataset that exists must point at a database that exists. Checked even
+# when registration was skipped: a dangling dataset is the failure Superset's
+# YAML import path produces silently, and an empty table trivially passes.
 dangling=$(pg "SELECT count(*) FROM tables t LEFT JOIN dbs d ON d.id = t.database_id WHERE d.id IS NULL")
 [ "${dangling:-1}" = "0" ] \
   && pass "no dataset points at a missing database" \
   || fail "${dangling} dataset(s) attached to a database that does not exist"
-
-# Columns are fetched from ClickHouse rather than declared, so a dataset with
-# none means fetch_metadata() failed quietly — the dataset exists and every
-# chart built on it will have nothing to select.
-for ds in $EXPECTED_DATASETS; do
-  cols=$(pg "SELECT count(*) FROM table_columns c JOIN tables t ON t.id = c.table_id WHERE t.table_name = '${ds}'")
-  [ "${cols:-0}" -ge 3 ] 2>/dev/null \
-    && pass "${ds} has ${cols} columns" \
-    || fail "${ds} has ${cols:-0} columns — fetch_metadata() found nothing"
-done
-
-# Metrics defined on the dataset rather than in individual charts. Two charts
-# that each define "revenue" will eventually disagree; one definition on the
-# dataset is inherited by every chart.
-metrics=$(pg "SELECT count(*) FROM sql_metrics m JOIN tables t ON t.id = m.table_id WHERE t.table_name IN ('daily_sales_by_category','customer_order_summary','recon_orders_by_source')")
-[ "${metrics:-0}" -ge 9 ] 2>/dev/null \
-  && pass "${metrics} metrics defined on the datasets" \
-  || fail "${metrics:-0} metrics, expected at least 9"
 
 # ---- does the connection actually work -------------------------------------
 if ! docker ps --format '{{.Names}}' | grep -qx clickhouse-01; then
@@ -244,6 +271,10 @@ fi
 # ---------------------------------------------------------------------------
 #  6. The application
 # ---------------------------------------------------------------------------
+#  /health answers before Superset has finished loading its metadata, so a
+#  healthy container says the process is alive and nothing more. The login
+#  page requires the application to be serving properly.
+# ---------------------------------------------------------------------------
 info "The application (waiting up to ${UI_TIMEOUT}s)"
 
 ui_ok=0
@@ -271,12 +302,19 @@ printf '%s' "$version_out" | grep -q "${SUPERSET_VERSION%%.*}" \
 # ---------------------------------------------------------------------------
 #  7. Caching
 # ---------------------------------------------------------------------------
+#  Not decoration. Without a backing store Superset keeps dashboard filter
+#  state in the metadata database, and the UI grows slower with every
+#  interaction — which reads as Superset being slow rather than as a cache
+#  that was never configured.
+# ---------------------------------------------------------------------------
 info "Caching"
 
 $COMPOSE exec -T superset-redis redis-cli ping 2>/dev/null | grep -qi pong \
   && pass "Redis answers" \
   || fail "Redis does not answer"
 
+# Read from the running application rather than from the file: a config that
+# failed to import leaves Superset running on its defaults, silently.
 cache_type=$(sup "$VENV_PY" -c \
   "from superset.app import create_app; a=create_app(); print(a.config['FILTER_STATE_CACHE_CONFIG']['CACHE_TYPE'])")
 printf '%s' "$cache_type" | grep -qi 'redis' \
