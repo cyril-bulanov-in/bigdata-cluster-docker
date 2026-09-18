@@ -1,0 +1,186 @@
+# ============================================================================
+#  Alerting rules for the 08-superset stack
+# ============================================================================
+#  Lives here because Prometheus mounts one rules directory and each stack
+#  contributes a file named after itself. Rules for a stack that is not
+#  running reference metrics that do not exist and stay inactive.
+#
+#  ---------------------------------------------------------------------------
+#  Superset is not scraped, and liveness comes from cAdvisor
+#  ---------------------------------------------------------------------------
+#  Superset serves no Prometheus endpoint — everything it reports goes out
+#  over StatsD to the exporter in that stack.
+#
+#  Pointing service discovery at its /health looks like an easy liveness
+#  signal and is a trap: that endpoint returns the word OK, not exposition
+#  format, so Prometheus marks the target down on a parse error and
+#  up{job="superset"} sits at zero for ever. An alert that always fires is
+#  worse than no alert, because it teaches people to ignore the one that
+#  matters.
+#
+#  So the container is watched through cAdvisor, which has collected
+#  per-container metrics since step 2.
+#
+#  ---------------------------------------------------------------------------
+#  The metric names here were read from a running Superset
+#  ---------------------------------------------------------------------------
+#  The first draft of this file used superset_chart and superset_errors_total,
+#  invented by analogy with Airflow. Neither exists. Superset's StatsD names
+#  are <ApiClass>.<method>.<outcome> plus a handful of bare operation names,
+#  and 08-superset/statsd/mapping.yml turns them into the metrics used below.
+#
+#  Re-check after any Superset upgrade — those names are not a documented
+#  interface:
+#
+#      curl -s 'http://localhost:9090/api/v1/label/__name__/values' \
+#        | tr ',' '\n' | grep -o 'superset_[a-z_]*' | sort -u
+#
+#  Two of the six MinIO rules in step 5 had the same defect. A rule naming an
+#  absent metric never fires and never complains — it sits in the UI looking
+#  like coverage.
+# ============================================================================
+
+groups:
+
+  - name: superset
+    rules:
+
+      # ----------------------------------------------------------------------
+      #  The one that matters most
+      # ----------------------------------------------------------------------
+      #  Superset is where a person notices the platform is broken. Kafka can
+      #  lag, a dbt model can fail, a Spark job can die — and the first
+      #  symptom anyone outside the team sees is a dashboard that will not
+      #  load.
+      #
+      #  container_last_seen is cAdvisor's timestamp of the last time it saw
+      #  the container. Comparing it against now() catches both a stopped
+      #  container and one that vanished, without Superset exposing anything.
+      # ----------------------------------------------------------------------
+      - alert: SupersetDown
+        expr: |
+          time() - max by (name) (container_last_seen{name="superset"}) > 120
+          or absent(container_last_seen{name="superset"})
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The Superset container is not running"
+          description: >
+            Dashboards are unavailable. Everything upstream may be perfectly
+            healthy; this is the layer people actually look at.
+
+      # The exporter, as distinct from Superset. Losing it hides every metric
+      # rule below without hiding the one above — the confusing state worth
+      # naming.
+      - alert: SupersetMetricsMissing
+        expr: up{job="superset-statsd"} == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The Superset StatsD exporter is not being scraped"
+          description: >
+            Superset itself may be fine. Every other Superset metric alert is
+            blind while this is true.
+
+      # ----------------------------------------------------------------------
+      #  API calls failing
+      # ----------------------------------------------------------------------
+      #  Superset reports each API call as <resource>.<method>.<outcome>, and
+      #  the mapping keeps the outcome as a label. Anything that is not
+      #  `success` is a request that failed — which a user sees as one red
+      #  panel on an otherwise fine page, and therefore never reports.
+      #
+      #  A rate rather than a count: one failure is someone still writing a
+      #  query, a sustained rate is something broken underneath.
+      # ----------------------------------------------------------------------
+      - alert: SupersetApiErrors
+        expr: |
+          sum(rate(superset_api{outcome!="success"}[10m])) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            Superset API calls are failing at
+            {{ $value | printf "%.2f" }}/s
+
+      # ----------------------------------------------------------------------
+      #  Slow queries against the warehouse
+      # ----------------------------------------------------------------------
+      #  execute_sql is the time ClickHouse took, as distinct from the time
+      #  Superset spent turning the result into a chart. Separating the two
+      #  matters: a slow chart with a fast execute_sql is slow in Superset,
+      #  which is a different problem and a different team.
+      #
+      #  The 90th percentile rather than the mean, because a mean hides the
+      #  case that matters: most charts fast, one dashboard unusable.
+      #
+      #  Ten seconds because these marts are small and answer in
+      #  milliseconds. On a real warehouse this threshold would be a
+      #  negotiation rather than a number.
+      # ----------------------------------------------------------------------
+      - alert: SupersetSlowQueries
+        expr: superset_execute_sql{quantile="0.9"} > 10000
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            Warehouse queries from Superset are taking
+            {{ $value | printf "%.0f" }}ms at the 90th percentile
+
+      # ----------------------------------------------------------------------
+      #  Slow rendering, as distinct from slow querying
+      # ----------------------------------------------------------------------
+      - alert: SupersetSlowRendering
+        expr: superset_load_into_dataframe{quantile="0.9"} > 5000
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            Superset is spending {{ $value | printf "%.0f" }}ms at the 90th
+            percentile turning results into charts
+          description: >
+            The warehouse may be answering quickly. This is time spent after
+            that.
+
+  # --------------------------------------------------------------------------
+  #  The layer underneath
+  # --------------------------------------------------------------------------
+  #  Superset is only as available as the database it queries and the one it
+  #  stores itself in. Both failures present to a user as "the dashboard is
+  #  broken", and neither is visible in Superset's own metrics.
+  # --------------------------------------------------------------------------
+  - name: superset-dependencies
+    rules:
+
+      - alert: SupersetMetadataDatabaseDown
+        expr: |
+          time() - max by (name) (container_last_seen{name="superset-postgres"}) > 120
+          or absent(container_last_seen{name="superset-postgres"})
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Superset's metadata database is not running"
+          description: >
+            Superset cannot load a dashboard definition, list a chart or
+            authenticate anyone. The UI may still serve a login page.
+
+      # Redis holds the caches. Losing it does not break Superset — it makes
+      # it slow, and slow in a way that looks like the warehouse being slow.
+      - alert: SupersetCacheDown
+        expr: |
+          time() - max by (name) (container_last_seen{name="superset-redis"}) > 300
+          or absent(container_last_seen{name="superset-redis"})
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Superset's cache is not running"
+          description: >
+            Dashboards still work. Every filter interaction now goes to the
+            metadata database instead, which gets slower as it grows.

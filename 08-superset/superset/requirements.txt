@@ -16,3 +16,9 @@ clickhouse-connect==1.8.0
 #
 # The binary wheel, so the build needs no compiler or libpq headers.
 psycopg2-binary==2.9.10
+
+# The StatsD client. StatsdStatsLogger imports cleanly without it and fails
+# when constructed, so the failure lands in superset_config.py at startup and
+# takes down every command — including `db upgrade`, which has nothing to do
+# with metrics.
+statsd==4.0.1

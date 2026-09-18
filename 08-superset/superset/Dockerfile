@@ -51,8 +51,8 @@ RUN uv pip install --python /app/.venv/bin/python \
 #
 #  An explicit import moves that discovery to build time, where it belongs.
 # ----------------------------------------------------------------------------
-RUN /app/.venv/bin/python -c "import psycopg2, clickhouse_connect; \
-print('drivers present:', psycopg2.__version__, clickhouse_connect.__version__)"
+RUN /app/.venv/bin/python -c "import psycopg2, clickhouse_connect, statsd; \
+print('drivers present:', psycopg2.__version__, clickhouse_connect.__version__, statsd.__version__)"
 
 # Back to the unprivileged user the image was built around. Superset does not
 # need root at runtime, and leaving it as root would be a habit worth not

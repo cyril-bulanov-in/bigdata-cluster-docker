@@ -1,0 +1,182 @@
+# ============================================================================
+#  Superset's StatsD metrics, translated for Prometheus
+# ============================================================================
+#  Superset emits StatsD, Prometheus scrapes HTTP, and this file is the
+#  translation between them.
+#
+#  A second exporter rather than sharing Airflow's, which does the same job in
+#  step 4. One container more, and worth it: the two tools name things
+#  differently, and a shared mapping file would interleave their conventions
+#  until nobody could tell which rule belonged to which.
+#
+# ----------------------------------------------------------------------------
+#  These names were read from a running Superset, not guessed
+# ----------------------------------------------------------------------------
+#  The first version of this file invented a shape — superset.chart.*,
+#  superset.sqllab.* and so on — by analogy with Airflow. Not one rule
+#  matched. Everything fell through to the catch-all at the bottom, which is
+#  precisely what the catch-all is for:
+#
+#      curl -s 'http://localhost:9090/api/v1/query?query=superset_other' \
+#        | python3 -c "import json,sys; [print(r['metric'].get('metric')) \
+#          for r in json.load(sys.stdin)['data']['result']]" | sort -u
+#
+#  What Superset actually sends is two shapes. Most of it is
+#  <ApiClass>.<method>.<outcome> — DashboardRestApi.get.success and the like.
+#  The rest are bare operation names: execute_sql, load_into_dataframe,
+#  loaded_from_source, set_cache_key.
+#
+#  Those names are not a documented interface. They change between releases,
+#  and the catch-all is what turns such a change into something visible rather
+#  than a graph that quietly goes flat.
+#
+# ----------------------------------------------------------------------------
+#  Why the API rules are regex and the rest are globs
+# ----------------------------------------------------------------------------
+#  A glob `*` in this exporter matches one whole dot-separated segment, not
+#  part of one. So `superset.*RestApi.*` cannot match
+#  superset.DashboardRestApi.get — `*` would have to match "Dashboard" as a
+#  prefix of a segment, which it cannot do.
+#
+#  A pattern that matches nothing is not an error here. The rule is simply
+#  never applied and the metric falls through, which looks exactly like the
+#  metric not existing.
+# ----------------------------------------------------------------------------
+#  Order matters: the exporter takes the first matching rule. The specific
+#  names come before the general patterns for that reason.
+# ============================================================================
+
+defaults:
+  # StatsD timers arrive as a stream of observations. Summaries with quantiles
+  # cost less than histograms and answer the question actually asked of a
+  # dashboard tool: how slow is the slow end.
+  timer_type: summary
+  quantiles:
+    - quantile: 0.5
+      error: 0.05
+    - quantile: 0.9
+      error: 0.01
+    - quantile: 0.99
+      error: 0.001
+
+mappings:
+
+  # ---- noise, dropped first -----------------------------------------------
+  #  The health endpoint is polled by the container healthcheck every twenty
+  #  seconds and says nothing about Superset being useful. Dropped rather than
+  #  kept, because a metric nobody will ever graph is still a series
+  #  Prometheus stores for ever.
+  - match: "superset.health"
+    match_type: glob
+    action: drop
+    name: "dropped"
+
+  - match: "superset.log"
+    match_type: glob
+    action: drop
+    name: "dropped"
+
+  # ---- named operations, before the API patterns --------------------------
+  #  These are dotted names that the API regexes below would otherwise
+  #  capture with nonsense labels.
+
+  #  Time spent turning results into a chart, after the warehouse has
+  #  answered. A chart that is slow while execute_sql is fast is slow in
+  #  Superset, not in ClickHouse — a different problem and a different team.
+  - match: "superset.ChartDataRestApi.json_dumps"
+    match_type: glob
+    name: "superset_json_dumps"
+
+  - match: "superset.QueryObject.post_processing"
+    match_type: glob
+    name: "superset_post_processing"
+
+  # ---- the REST API, with an outcome --------------------------------------
+  #  DashboardRestApi.get.success, ChartDataRestApi.data.success and so on.
+  #  The three parts become labels rather than part of the metric name: a
+  #  hundred endpoints would otherwise be a hundred metrics, which is how a
+  #  Prometheus instance runs out of memory.
+  - match: '^superset\.([A-Za-z]+)RestApi\.([^.]+)\.([^.]+)$'
+    match_type: regex
+    name: "superset_api"
+    labels:
+      resource: "$1"
+      method: "$2"
+      outcome: "$3"
+
+  # ---- the REST API, without one ------------------------------------------
+  #  DashboardRestApi.get — the timing, as distinct from the outcome counter
+  #  above.
+  - match: '^superset\.([A-Za-z]+)RestApi\.([^.]+)$'
+    match_type: regex
+    name: "superset_api_duration"
+    labels:
+      resource: "$1"
+      method: "$2"
+
+  # ---- running a query ----------------------------------------------------
+  #  The number that matters to whoever is looking at a dashboard: how long
+  #  the warehouse took.
+  - match: "superset.execute_sql"
+    match_type: glob
+    name: "superset_execute_sql"
+
+  # ---- the cache ----------------------------------------------------------
+  #  loaded_from_source means the cache did not have it. The ratio between
+  #  these and set_cache_key is what says whether the Redis in this stack is
+  #  earning its place.
+  - match: "superset.loaded_from_source"
+    match_type: glob
+    name: "superset_loaded_from_source"
+
+  - match: "superset.loaded_from_source_without_force"
+    match_type: glob
+    name: "superset_loaded_from_source_no_force"
+
+  # The other half of the cache picture, and the half that makes the first
+  # half useful. loaded_from_source says the cache missed; these say it hit.
+  #
+  # Both were absent from the first two versions of this file and only showed
+  # up in superset_other — which is the third thing that rule has caught.
+  #
+  #   loading_from_cache   an attempt started
+  #   loaded_from_cache    it succeeded
+  #
+  # The ratio of loaded_from_cache to loaded_from_source is the hit rate, and
+  # the gap between loading_ and loaded_ is attempts that fell through.
+  - match: "superset.loading_from_cache"
+    match_type: glob
+    name: "superset_loading_from_cache"
+
+  - match: "superset.loaded_from_cache"
+    match_type: glob
+    name: "superset_loaded_from_cache"
+
+  - match: "superset.set_cache_key"
+    match_type: glob
+    name: "superset_set_cache_key"
+
+  - match: "superset.load_into_dataframe"
+    match_type: glob
+    name: "superset_load_into_dataframe"
+
+  - match: "superset._get_data_response"
+    match_type: glob
+    name: "superset_get_data_response"
+
+  # ---- dashboards ---------------------------------------------------------
+  - match: "superset.dashboard"
+    match_type: glob
+    name: "superset_dashboard"
+
+  # ---- everything else ----------------------------------------------------
+  #  Keeps unmatched metrics under a predictable prefix rather than dropping
+  #  them, so a name a future release adds shows up as itself and can be given
+  #  a proper rule once someone notices it.
+  #
+  #  This rule found every mistake in the first version of this file.
+  - match: '^superset\.(.+)$'
+    match_type: regex
+    name: "superset_other"
+    labels:
+      metric: "$1"

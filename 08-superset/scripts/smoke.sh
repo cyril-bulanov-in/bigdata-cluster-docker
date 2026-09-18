@@ -16,6 +16,8 @@
 #     documented YAML import produces silently
 #   a dashboard with no position_json, which renders every chart stacked in one
 #     column and looks like a styling problem
+#   StatsD mapping rules that match nothing, so every metric lands in the
+#     catch-all and every Grafana panel is empty for a reason no error reports
 #
 # Usage:  ./scripts/smoke.sh          (or: make smoke)
 
@@ -36,6 +38,7 @@ DB_NAME="$(read_env SUPERSET_DB_NAME .env)";          DB_NAME="${DB_NAME:-supers
 DB_USER="$(read_env SUPERSET_DB_USER .env)";          DB_USER="${DB_USER:-superset}"
 CH_NAME="$(read_env SUPERSET_CLICKHOUSE_NAME .env)";  CH_NAME="${CH_NAME:-ClickHouse marts}"
 CH_MARTS="$(read_env CLICKHOUSE_MARTS_DB .env)";      CH_MARTS="${CH_MARTS:-marts_marts}"
+PROM_PORT="$(read_env PROMETHEUS_PORT ../02-monitoring/.env)"; PROM_PORT="${PROM_PORT:-9090}"
 
 # Set where there is no warehouse to read columns from. The environment wins
 # over the file, because CI sets it as a job-level variable rather than
@@ -45,6 +48,7 @@ SKIP_DATASETS="${SKIP_DATASETS:-0}"
 
 IMAGE="dataplatform/superset:${SUPERSET_VERSION}"
 SUPERSET="http://localhost:${SUPERSET_PORT}"
+PROM="http://localhost:${PROM_PORT}"
 
 EXPECTED_DATASETS="daily_sales_by_category customer_order_summary recon_orders_by_source"
 DASHBOARD_SLUG="platform-overview"
@@ -57,6 +61,8 @@ EXPECTED_CHARTS=8
 VENV_PY="/app/.venv/bin/python"
 
 UI_TIMEOUT=180
+METRIC_TIMEOUT=120
+METRIC_INTERVAL=10
 
 PASSED=0; FAILED=0; SKIPPED=0
 pass() { printf '  \033[32mPASS\033[0m  %s\n' "$1"; PASSED=$((PASSED + 1)); }
@@ -83,7 +89,7 @@ fi
 # Imported through the venv's interpreter explicitly. `python -c` alone would
 # use whatever is first on the path — and the whole class of failure this
 # guards against is a package reachable from one interpreter and not the other.
-for mod in psycopg2 clickhouse_connect; do
+for mod in psycopg2 clickhouse_connect statsd; do
   if docker run --rm --entrypoint "$VENV_PY" "$IMAGE" -c "import ${mod}" >/dev/null 2>&1; then
     pass "${mod} is importable from ${VENV_PY}"
   else
@@ -108,7 +114,7 @@ fi
 
 info "The containers"
 
-for c in superset superset-postgres superset-redis; do
+for c in superset superset-postgres superset-redis superset-statsd; do
   state=$($COMPOSE ps --format '{{.Name}} {{.State}}' 2>/dev/null | awk -v n="$c" '$1 == n {print $2}' || true)
   [ "$state" = "running" ] \
     && pass "$c is running" \
@@ -313,7 +319,84 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-#  7. The application
+#  7. Metrics
+# ---------------------------------------------------------------------------
+#  Superset speaks StatsD and serves no Prometheus endpoint, so a second
+#  exporter translates. Everything here is about the translation, because that
+#  is where this stack went wrong three times in one sitting.
+#
+#  The mapping rules in statsd/mapping.yml were invented by analogy the first
+#  time and matched nothing. Then the API rules used globs, which match a
+#  whole dot-separated segment rather than part of one, so they matched
+#  nothing either. Then two cache metrics turned out to exist that nobody had
+#  thought to map.
+#
+#  None of that raised an error. A rule that matches nothing is simply never
+#  applied, and the metric falls through to the catch-all — which is exactly
+#  what the catch-all is for, and why the last check here is the important
+#  one.
+# ---------------------------------------------------------------------------
+info "Metrics (waiting up to ${METRIC_TIMEOUT}s)"
+
+if ! docker ps --format '{{.Names}}' | grep -qx prometheus; then
+  skip "the exporter is scraped — Prometheus is not running"
+  skip "Superset metrics exist — Prometheus is not running"
+  skip "nothing falls through to the catch-all — Prometheus is not running"
+else
+  # Prometheus polls Docker for new containers every 30s, so a container
+  # started in the same wave is not discovered on the first pass.
+  waited=0
+  targets=0
+  while :; do
+    body=$(curl -fsS --max-time 10 "${PROM}/api/v1/targets?state=active" 2>/dev/null || true)
+    targets=$(printf '%s' "$body" | grep -o '"job": *"superset-statsd"' | wc -l | tr -d ' ' || true)
+    [ "${targets:-0}" -ge 1 ] && break
+    [ "$waited" -ge "$METRIC_TIMEOUT" ] && break
+    sleep "$METRIC_INTERVAL"; waited=$((waited + METRIC_INTERVAL))
+  done
+  [ "${targets:-0}" -ge 1 ] \
+    && pass "Prometheus is scraping the Superset exporter (after ${waited}s)" \
+    || fail "no superset-statsd target after ${METRIC_TIMEOUT}s — check the prometheus labels"
+
+  # At least the query metric, which appears as soon as anyone opens a chart.
+  # Absent means either nobody has, or the mapping stopped matching.
+  named=$(curl -fsS --max-time 10 "${PROM}/api/v1/label/__name__/values" 2>/dev/null \
+    | tr ',' '\n' | grep -c -o 'superset_[a-z_]*' || true)
+  [ "${named:-0}" -ge 3 ] 2>/dev/null \
+    && pass "${named} superset_* metric names present" \
+    || skip "only ${named:-0} superset_* names — open a dashboard and re-run"
+
+  # ---- the check that found every mistake in this stack ------------------
+  #  superset_other is the catch-all. Anything in it is a metric Superset
+  #  emits that no rule covers — which is not an error, and is exactly the
+  #  thing that would otherwise be noticed months later as an empty Grafana
+  #  panel.
+  #
+  #  A warning rather than a failure: a Superset upgrade adding a metric is
+  #  normal, and the right response is to add a rule, not to go red.
+  unmapped=$(curl -fsS --max-time 10 --get \
+    --data-urlencode 'query=count(superset_other)' \
+    "${PROM}/api/v1/query" 2>/dev/null \
+    | grep -o '"[0-9]*"\]' | head -1 | tr -d '"]' || true)
+
+  if [ -z "${unmapped}" ] || [ "${unmapped}" = "0" ]; then
+    pass "nothing is falling through to superset_other"
+  else
+    skip "${unmapped} metric(s) in superset_other — a name no rule covers yet"
+    curl -fsS --max-time 10 "${PROM}/api/v1/query?query=superset_other" 2>/dev/null \
+      | python3 -c "
+import json, sys
+try:
+    for r in json.load(sys.stdin)['data']['result'][:8]:
+        print('        ' + str(r['metric'].get('metric')))
+except Exception:
+    pass
+" || true
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+#  8. The application
 # ---------------------------------------------------------------------------
 #  /health answers before Superset has finished loading its metadata, so a
 #  healthy container says the process is alive and nothing more. The login
@@ -344,7 +427,7 @@ printf '%s' "$version_out" | grep -q "${SUPERSET_VERSION%%.*}" \
   || fail "Superset did not report version ${SUPERSET_VERSION}: ${version_out:-nothing}"
 
 # ---------------------------------------------------------------------------
-#  8. Caching
+#  9. Caching
 # ---------------------------------------------------------------------------
 #  Not decoration. Without a backing store Superset keeps dashboard filter
 #  state in the metadata database, and the UI grows slower with every
@@ -365,13 +448,22 @@ printf '%s' "$cache_type" | grep -qi 'redis' \
   && pass "filter state is cached in Redis" \
   || fail "filter state cache is '${cache_type:-unset}' — superset_config.py may not have been loaded"
 
+# The StatsD logger, read the same way. A config that imported but left
+# STATS_LOGGER at its default sends every metric nowhere, and the exporter
+# stays up and empty.
+stats_logger=$(sup "$VENV_PY" -c \
+  "from superset.app import create_app; a=create_app(); print(type(a.config['STATS_LOGGER']).__name__)")
+printf '%s' "$stats_logger" | grep -qi 'statsd' \
+  && pass "the StatsD logger is configured (${stats_logger})" \
+  || fail "STATS_LOGGER is '${stats_logger:-unset}' — metrics go nowhere and the exporter stays empty"
+
 # ---------------------------------------------------------------------------
 info "Summary"
 printf '  %d passed, %d failed, %d skipped\n\n' "$PASSED" "$FAILED" "$SKIPPED"
 
 if [ "$SKIPPED" -gt 0 ]; then
-  echo "  Some checks need the warehouse. Run the full test from a platform"
-  echo "  started with the ClickHouse cluster."
+  echo "  Some checks need the warehouse or Prometheus. Run the full test from"
+  echo "  a platform started with the ClickHouse cluster."
   echo ""
 fi
 

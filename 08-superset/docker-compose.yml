@@ -2,9 +2,9 @@
 #  PLATFORM — step 8: dashboards
 # ============================================================================
 #
-#  Superset with its own metadata database, a Redis for caching, a connection
-#  to the warehouse and datasets over the dbt marts — all registered from
-#  files rather than clicked into the UI.
+#  Superset with its own metadata database, a Redis for caching, a StatsD
+#  exporter for metrics, and a connection, datasets and dashboard all built
+#  from files rather than clicked into the UI.
 #
 #  Start:  make up
 #  UI:     http://localhost:8089
@@ -54,8 +54,8 @@ services:
   # ==========================================================================
   #  Redis, for caching only
   # ==========================================================================
-  #  Superset keeps four separate caches here: chart data, query results,
-  #  dashboard filter state and explore form state.
+  #  Four caches: chart data, query results, dashboard filter state, explore
+  #  form state.
   #
   #  Filter state is the one that matters most and is easiest to overlook.
   #  Without a backing store Superset keeps it in the metadata database, and
@@ -73,6 +73,10 @@ services:
     # No volume. Everything here is a cache — losing it costs one slow page
     # load, and persisting it would mean a stale filter surviving a rebuild.
     command: ["redis-server", "--save", "", "--appendonly", "no"]
+    labels:
+      # No Prometheus endpoint either. SupersetCacheDown watches the container
+      # through cAdvisor, the same way SupersetDown watches Superset itself.
+      prometheus.scrape: "false"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -81,7 +85,41 @@ services:
       start_period: 5s
 
   # ==========================================================================
-  #  One-shot: migrate, create the admin, register connection and datasets
+  #  StatsD to Prometheus
+  # ==========================================================================
+  #  Superset speaks StatsD, like Airflow and unlike everything else here.
+  #
+  #  Its own exporter rather than sharing the one in 04-etl. One container
+  #  more, and worth it: the two tools name things differently, and a shared
+  #  mapping file would interleave their conventions until nobody could tell
+  #  which rule belonged to which.
+  #
+  #  Discovered by label, like every exporter since 02-monitoring.
+  # ==========================================================================
+  superset-statsd:
+    image: prom/statsd-exporter:${STATSD_EXPORTER_VERSION}
+    container_name: superset-statsd
+    restart: unless-stopped
+    networks: [dataplatform]
+    command:
+      - '--statsd.mapping-config=/etc/statsd/mapping.yml'
+      - '--statsd.listen-udp=:9125'
+      - '--web.listen-address=:9102'
+    volumes:
+      - ./statsd/mapping.yml:/etc/statsd/mapping.yml:ro
+    labels:
+      prometheus.scrape: "true"
+      prometheus.port: "9102"
+      prometheus.job: "superset-statsd"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9102/metrics >/dev/null 2>&1 || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 6
+      start_period: 15s
+
+  # ==========================================================================
+  #  One-shot: migrate, create the admin, register everything
   # ==========================================================================
   #  Four steps that must run in order and must finish before the web process.
   #
@@ -91,7 +129,8 @@ services:
   #
   #  register.sh comes last, because it needs the schema and the roles. It is
   #  idempotent, so running it on every start costs nothing and means a fresh
-  #  volume comes back with the warehouse connected and its marts registered.
+  #  volume comes back with the warehouse connected, its marts registered and
+  #  the dashboard built.
   # ==========================================================================
   superset-init:
     build:
@@ -113,26 +152,26 @@ services:
       # rather than reading a path, so the directory goes on PYTHONPATH and
       # the file has to be named exactly this.
       PYTHONPATH: /app/pythonpath
-      # Read by register.sh and datasets.py. The password never appears in a
-      # committed file.
+      # ---- metrics --------------------------------------------------------
+      # StatsD is fire-and-forget over UDP: Superset does not notice whether
+      # anything is listening, so a missing exporter costs nothing at runtime
+      # and shows up only as an absence in Grafana.
+      SUPERSET_STATSD_ENABLED: "1"
+      SUPERSET_STATSD_HOST: superset-statsd
+      SUPERSET_STATSD_PORT: "9125"
+      SUPERSET_STATSD_PREFIX: superset
+      # ---- what register.sh and the scripts read --------------------------
       SUPERSET_CLICKHOUSE_NAME: ${SUPERSET_CLICKHOUSE_NAME}
+      SUPERSET_DASHBOARD_TITLE: ${SUPERSET_DASHBOARD_TITLE}
       CLICKHOUSE_HOST: ${CLICKHOUSE_HOST}
       CLICKHOUSE_PORT: ${CLICKHOUSE_PORT}
       CLICKHOUSE_USER: ${CLICKHOUSE_USER}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
       CLICKHOUSE_MARTS_DB: ${CLICKHOUSE_MARTS_DB}
-      # ----------------------------------------------------------------------
-      #  Skipping the dataset step where there is no warehouse
-      # ----------------------------------------------------------------------
-      #  Registering the connection is writing a string; registering a dataset
-      #  means asking ClickHouse what columns a mart has, because a
-      #  hand-written column list drifts the moment a model changes.
-      #
-      #  CI starts only the three Superset services, so there is nothing to
-      #  ask and the step fails on name resolution. Setting this to 1 there
-      #  makes it deliberately not run and say so — rather than wrapping it in
-      #  a `|| true` that would swallow a real failure just as quietly.
-      # ----------------------------------------------------------------------
+      # Registering the connection is writing a string. Registering a dataset
+      # means asking ClickHouse what columns a mart has, and the dashboard
+      # needs the datasets — so both are skipped where there is no warehouse,
+      # deliberately rather than by swallowing the error.
       SUPERSET_SKIP_DATASETS: ${SUPERSET_SKIP_DATASETS:-0}
     volumes: &superset-volumes
       - ./superset/superset_config.py:/app/pythonpath/superset_config.py:ro
@@ -170,6 +209,24 @@ services:
     volumes: *superset-volumes
     ports:
       - "${SUPERSET_PORT}:8088"
+    labels:
+      # ----------------------------------------------------------------------
+      #  Not scraped, and that is deliberate
+      # ----------------------------------------------------------------------
+      #  Superset serves no Prometheus endpoint. Everything it reports goes
+      #  out over StatsD to the exporter above.
+      #
+      #  Pointing docker-sd at /health looks like a way to get a liveness
+      #  signal and is a trap: that endpoint returns the word OK, not
+      #  exposition format, so Prometheus marks the target down on a parse
+      #  error. `up{job="superset"}` would then be permanently zero and the
+      #  alert would fire for ever — which is worse than having no alert,
+      #  because it trains people to ignore the one that matters.
+      #
+      #  Liveness comes from cAdvisor instead, which has watched every
+      #  container since step 2. See SupersetDown in the rules file.
+      # ----------------------------------------------------------------------
+      prometheus.scrape: "false"
     depends_on:
       superset-init:
         condition: service_completed_successfully

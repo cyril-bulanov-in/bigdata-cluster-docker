@@ -2,7 +2,7 @@
 #  Superset configuration
 # ============================================================================
 #  Mounted rather than baked into the image: this is configuration, and it
-#  changes independently of the driver the image exists to provide.
+#  changes independently of the drivers the image exists to provide.
 #
 #  Superset reads whatever Python file PYTHONPATH exposes as
 #  superset_config.py. It is executed, not parsed, so everything here is
@@ -44,27 +44,21 @@ SQLALCHEMY_DATABASE_URI = (
     f"@superset-postgres:5432/{env('SUPERSET_DB_NAME')}"
 )
 
-# Superset logs a warning on every start without this and defaults to False in
-# a future version anyway.
 SQLALCHEMY_TRACK_MODIFICATIONS = False
 
 # ---------------------------------------------------------------------------
 #  Caching
 # ---------------------------------------------------------------------------
-#  Redis, for three separate caches Superset keeps apart:
+#  Redis, for four caches Superset keeps apart: rendered chart data, query
+#  results, dashboard filter state and explore form state.
 #
-#    CACHE_CONFIG            rendered chart data
-#    DATA_CACHE_CONFIG       query results
-#    FILTER_STATE_CACHE      what a dashboard's filters are set to
+#  Filter state is not optional in practice. Without a backing store Superset
+#  keeps it in the metadata database and the UI grows slower with every
+#  dashboard interaction — which reads as Superset being slow rather than as a
+#  missing cache.
 #
-#  The last one is not optional in practice. Without a backing store Superset
-#  keeps filter state in the metadata database and the UI grows slower with
-#  every dashboard interaction, which reads as Superset being slow rather than
-#  as a missing cache.
-#
-#  No Celery worker here: that is for running long queries in the background,
-#  and the marts this reads answer in milliseconds. Adding a worker would be
-#  complexity for its own sake.
+#  No Celery worker: that is for running long queries in the background, and
+#  the marts this reads answer in milliseconds.
 # ---------------------------------------------------------------------------
 REDIS_URL = f"redis://{env('REDIS_HOST', 'superset-redis')}:6379"
 
@@ -97,19 +91,39 @@ EXPLORE_FORM_DATA_CACHE_CONFIG = {
 }
 
 # ---------------------------------------------------------------------------
+#  Metrics
+# ---------------------------------------------------------------------------
+#  Superset speaks StatsD, like Airflow and unlike everything else here. A
+#  second exporter translates — its own rather than Airflow's, because the
+#  two tools name things differently and a shared mapping file would
+#  interleave their conventions until nobody could tell which rule belonged
+#  to which.
+#
+#  StatsD is fire-and-forget over UDP. Superset does not notice whether
+#  anything is listening, so a missing exporter costs nothing at runtime and
+#  shows up only as an absence in Grafana — which is why there is an alert for
+#  the exporter itself and not only for Superset.
+# ---------------------------------------------------------------------------
+if env("SUPERSET_STATSD_ENABLED", "1") == "1":
+    from superset.stats_logger import StatsdStatsLogger
+
+    STATS_LOGGER = StatsdStatsLogger(
+        host=env("SUPERSET_STATSD_HOST", "superset-statsd"),
+        port=int(env("SUPERSET_STATSD_PORT", "9125")),
+        prefix=env("SUPERSET_STATSD_PREFIX", "superset"),
+    )
+
+# ---------------------------------------------------------------------------
 #  Features
 # ---------------------------------------------------------------------------
 FEATURE_FLAGS = {
-    # Lets a dashboard be exported and imported as files, which is what makes
-    # the next parts of this stack possible: a dashboard that exists only in
-    # someone's browser is not part of the project and does not survive
-    # `make clean`.
+    # Lets a dashboard be exported and imported as files. Not how this stack
+    # builds its dashboard — dashboard.py does that from code — but worth
+    # having for anyone who wants to take one elsewhere.
     "VERSIONED_EXPORT": True,
     # Cross-filters: clicking a bar filters the rest of the dashboard.
     "DASHBOARD_CROSS_FILTERS": True,
-    # Lets a query result be saved as a virtual dataset without writing to the
-    # warehouse. Useful here because the warehouse is read-only from
-    # Superset's point of view.
+    # Jinja in SQL Lab and in virtual datasets.
     "ENABLE_TEMPLATE_PROCESSING": True,
 }
 
@@ -119,13 +133,8 @@ FEATURE_FLAGS = {
 SUPERSET_WEBSERVER_TIMEOUT = 60
 SQLLAB_TIMEOUT = 60
 
-# ---------------------------------------------------------------------------
-#  Behind nothing, for now
-# ---------------------------------------------------------------------------
-#  Superset is reached directly on its published port. If it is ever put
-#  behind a proxy, ENABLE_PROXY_FIX has to be set or every generated link
-#  points at the container's own address.
-# ---------------------------------------------------------------------------
+# Superset is reached directly on its published port. Behind a proxy this has
+# to be True or every generated link points at the container's own address.
 ENABLE_PROXY_FIX = False
 
 # The row limit applied when a chart does not set its own. Low on purpose: a
