@@ -99,7 +99,20 @@ jobs:
           # The gid owning the Docker socket. A fixed value does not travel:
           # 0 on Docker Desktop, the `docker` group on a runner. Getting it
           # wrong makes docker_sd discover nothing at all, silently.
-          sed -i "s/^DOCKER_GID=.*/DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)/" ../02-monitoring/.env
+          # Set in BOTH files, and that is not redundancy.
+          #
+          # Compose resolves variables from the .env beside the file being
+          # run, not beside the one declaring the service. Prometheus is
+          # declared in 02-monitoring and started from here, so it reads
+          # this stack's .env — where the variable has to exist too, or it
+          # falls back to 0 and discovery silently finds nothing.
+          DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)
+          for f in .env ../02-monitoring/.env; do
+            grep -q "^DOCKER_GID=" "$f" \
+              && sed -i "s/^DOCKER_GID=.*/DOCKER_GID=${DOCKER_GID}/" "$f" \
+              || echo "DOCKER_GID=${DOCKER_GID}" >> "$f"
+          done
+          echo "docker socket gid: ${DOCKER_GID}"
           sed -i 's/^KAFKA_HEAP_OPTS=.*/KAFKA_HEAP_OPTS=-Xms256m -Xmx512m/' ../01-kafka/.env
           sed -i 's/^KAFKA_MEM_LIMIT=.*/KAFKA_MEM_LIMIT=1500m/' ../01-kafka/.env
           sed -i 's/^CONNECT_HEAP_OPTS=.*/CONNECT_HEAP_OPTS=-Xms256m -Xmx768m/' ../03-dbms/.env

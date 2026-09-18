@@ -59,7 +59,20 @@ jobs:
           cp .env.example .env
           cp ../02-monitoring/.env.example ../02-monitoring/.env
           cp ../01-kafka/.env.example ../01-kafka/.env
-          sed -i "s/^DOCKER_GID=.*/DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)/" ../02-monitoring/.env
+          # Set in BOTH files, and that is not redundancy.
+          #
+          # Compose resolves variables from the .env beside the file being
+          # run, not beside the one declaring the service. Prometheus is
+          # declared in 02-monitoring and started from here, so it reads
+          # this stack's .env — where the variable has to exist too, or it
+          # falls back to 0 and discovery silently finds nothing.
+          DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)
+          for f in .env ../02-monitoring/.env; do
+            grep -q "^DOCKER_GID=" "$f" \
+              && sed -i "s/^DOCKER_GID=.*/DOCKER_GID=${DOCKER_GID}/" "$f" \
+              || echo "DOCKER_GID=${DOCKER_GID}" >> "$f"
+          done
+          echo "docker socket gid: ${DOCKER_GID}"
           # The runner has less memory than a workstation. Only the Kafka and
           # Connect limits are lowered; every image version stays exactly as
           # pinned, so CI tests the same versions that run locally.
