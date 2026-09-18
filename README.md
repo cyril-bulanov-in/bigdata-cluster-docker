@@ -7,6 +7,7 @@
 [![05-minio](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/05-minio.yml/badge.svg?branch=main)](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/05-minio.yml)
 [![06-spark](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/06-spark.yml/badge.svg?branch=main)](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/06-spark.yml)
 [![07-dbt](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/07-dbt.yml/badge.svg?branch=main)](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/07-dbt.yml)
+[![08-superset](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/08-superset.yml/badge.svg?branch=main)](https://github.com/cyril-bulanov-in/bigdata-cluster-docker/actions/workflows/08-superset.yml)
 
 A working data platform, assembled with Docker Compose one component at a time.
 
@@ -59,6 +60,7 @@ environment.
 | Object storage | MinIO | MinIO on local disks | S3 |
 | Processing | Spark standalone | Spark standalone | EMR Serverless |
 | Transformation | dbt in a container | same | the same container |
+| Dashboards | Superset | Superset | Superset or QuickSight |
 | Jobs | container images | the same images | the same images |
 
 The job code is identical in all three columns. Only the operator in the DAG
@@ -131,7 +133,7 @@ connection nobody set up.
 | 05 | [MinIO](05-minio/) | S3-compatible storage, three-layer bucket layout, versioning, lifecycle rules | done |
 | 06 | [Spark](06-spark/) | standalone cluster of 4 workers, S3A with the committer S3 actually supports, raw to staged | done |
 | 07 | [dbt](07-dbt/) | models over all three sources, 50 tests, lineage docs, one Airflow task per model via Cosmos | done |
-| 08 | Superset | dashboards on top of the marts | next |
+| 08 | [Superset](08-superset/) | connection, datasets, charts and dashboard all built from code; StatsD metrics into Prometheus | done |
 
 Ordered so that each step gets its input from the previous one. Monitoring is
 second on purpose: from that point on, every stack arrives with metrics rather
@@ -139,9 +141,10 @@ than getting them bolted on. Storage comes before the thing that writes to it,
 and dbt comes after Spark so its models are built over the full picture rather
 than being rewritten when a second source appears.
 
-Candidates for after step 08, not yet committed: an open table format for the
-object storage layer, integration tests with Testcontainers, and a Terraform
-deployment of the same architecture to AWS.
+The eight steps are complete. Candidates for what comes next, none of them
+committed: an open table format for the object storage layer, integration
+tests with Testcontainers, and a Terraform deployment of the same architecture
+to AWS.
 
 ---
 
@@ -158,17 +161,25 @@ nothing gets scheduled. Kill a Spark worker mid-job and watch its tasks
 reschedule; kill the master and watch running jobs carry on regardless. Each
 stack README ends with drills of this kind.
 
-**Failures that leave everything green.** An exporter whose endpoint answers
-while exporting nothing usable. A `CREATE ... ON CLUSTER` that succeeds while
-every distributed query fails, because the two use different transports. A
-distributed JOIN that returns a plausible, wrong number because the join key is
-not the sharding key. A DAG that fails to import and is therefore absent rather
-than broken. A versioned bucket quietly keeping every overwrite for ever. A
-Spark job that writes `_SUCCESS` into an empty prefix because its committer
-staged the data somewhere the driver could not see. A dbt mart that counted
-cancelled orders as revenue for two steps, verified its own output, and was
-believed. An alerting rule naming a metric that does not exist, which never
-fires and never complains. These are what the smoke tests exist for.
+**Failures that leave everything green.** This is the spine of the project, and
+every stack contributed one. An exporter whose endpoint answers while exporting
+nothing usable. A `CREATE ... ON CLUSTER` that succeeds while every distributed
+query fails, because the two use different transports. A distributed JOIN that
+returns a plausible, wrong number because the join key is not the sharding key.
+A DAG that fails to import and is therefore absent rather than broken. A
+versioned bucket quietly keeping every overwrite for ever. A Spark job that
+writes `_SUCCESS` into an empty prefix because its committer staged the data
+somewhere the driver could not see. A dbt mart that counted cancelled orders as
+revenue for two steps, verified its own output, and was believed. A Python
+package installed into an interpreter the application never consults. StatsD
+mapping rules that match nothing, so every metric lands in a catch-all and
+every dashboard panel is empty for a reason nothing reports.
+
+Service discovery that finds zero containers because a group id defaulted to
+the wrong value — silently, for five steps, while every static target kept
+working.
+
+These are what the smoke tests exist for.
 
 **Correctness under change.** Deduplicating a stream of inserts, updates and
 deletes so readers see one current row. Why the version column must be a log
@@ -186,11 +197,12 @@ teardown and rebuild from scratch.
 ## Getting started
 
 Each stack runs independently and pulls in what it needs through Compose
-`include`. Starting step 7 starts all seven.
+`include`. Starting step 8 starts all eight.
 
 ```bash
-cd 07-dbt
+cd 08-superset
 cp .env.example .env
+cp ../07-dbt/.env.example ../07-dbt/.env
 cp ../06-spark/.env.example ../06-spark/.env
 cp ../05-minio/.env.example ../05-minio/.env
 cp ../04-etl/.env.example ../04-etl/.env
@@ -225,7 +237,8 @@ bigdata-cluster-docker/
     ├── scripts/smoke.sh   assertions about the running stack
     ├── dags/              scheduling only, no logic     (04-etl, 07-dbt)
     ├── jobs/              the work, as versioned images (04-etl, 06-spark)
-    └── project/           the dbt project               (07-dbt)
+    ├── project/           the dbt project               (07-dbt)
+    └── superset/          config and build scripts      (08-superset)
 ```
 
 ---
@@ -244,26 +257,37 @@ same rule applies to jars: their versions are fixed by what they must match,
 not chosen, and the Spark image build opens each one to confirm the class it is
 supposed to contain.
 
-**Configuration through `.env`.** Secrets and machine-specific values stay out
-of the repository. Each stack ships a documented `.env.example`, and `make up`
-refuses to start if the real file is missing.
+**Configuration through `.env`, repeated rather than inherited.** Compose
+resolves a variable from the `.env` beside the file being *run*, not beside the
+file that declares the service. So a value set in one stack is invisible when
+the same service is started from another, and the substitution falls back to a
+default. That cost five steps of a silently broken Prometheus before anyone
+noticed, and is why `DOCKER_GID` and `POSTGRES_VERSION` appear in several
+files that look like they should inherit them.
 
 **Exporters register themselves.** Since step 2 Prometheus discovers targets
 through the Docker API: an exporter carries `prometheus.scrape`,
 `prometheus.port` and optionally `prometheus.job` and `prometheus.path` as
 container labels, and no stack has to edit the monitoring configuration to be
-seen.
+seen. A service with no metrics endpoint carries `prometheus.scrape: "false"`
+and is watched through cAdvisor instead — pointing discovery at a health
+endpoint that returns plain text makes the target red for ever.
 
 **Jobs are images, not code in the orchestrator.** `dags/` decides when and
-with what parameters; `jobs/` and `project/` do the work. The two never mix,
-which is what keeps a job a versioned artifact that runs unchanged anywhere —
-and it is why step 7 runs dbt in containers rather than inside the scheduler,
-at the cost of a container start per model.
+with what parameters; `jobs/`, `project/` and `superset/` do the work. The two
+never mix, which is what keeps a job a versioned artifact that runs unchanged
+anywhere — and it is why step 7 runs dbt in containers rather than inside the
+scheduler, at the cost of a container start per model.
 
 **A DAG lives in the stack that provides what it needs.** Step 7's DAG sits in
 `07-dbt/dags/` rather than beside the others, because it reads a manifest only
 that stack produces. In `04-etl` it was a DAG that could not be parsed, and its
 CI failed on a file it had no way to satisfy.
+
+**Nothing is configured by clicking.** Grafana's dashboard, Superset's
+connection, datasets and dashboard are all built from files at startup.
+Anything that exists only in a browser does not survive `make clean` and is
+not part of the project.
 
 **Comments explain the why.** Compose files are written for someone who knows
 what a container is but has not memorised Kafka listener semantics, S3A
@@ -281,11 +305,9 @@ stack that a successful start does not prove. GitHub Actions runs both on every
 change, on a clean runner, from an empty state.
 
 Where CI cannot cover something, the stack README says so and gives the
-commands that do. Steps 3 to 7 are the current examples: eight ClickHouse nodes
-do not fit on a GitHub runner, so those workflows start everything else and the
-skipped assertions print as `SKIP` rather than quietly disappearing. Step 7 is
-the extreme case — dbt does nothing without a warehouse, so its workflow checks
-parsing and the manifest and says so plainly.
+commands that do. Steps 3 to 8 are the current examples: eight ClickHouse nodes
+do not fit on a GitHub runner, so those workflows start what they can and the
+skipped assertions print as `SKIP` rather than quietly disappearing.
 
 ---
 
