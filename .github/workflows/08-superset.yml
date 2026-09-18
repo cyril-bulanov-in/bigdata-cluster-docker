@@ -6,7 +6,7 @@
 # drivers, and its schema. Starting seven other stacks to reach those checks
 # would spend twenty minutes on nothing.
 #
-# The connection to the warehouse is checked locally; see
+# What that costs is the datasets, which are read from the warehouse; see
 # "What continuous integration does not cover" in 08-superset/README.md.
 
 name: 08-superset
@@ -36,6 +36,26 @@ jobs:
       run:
         working-directory: 08-superset
 
+    env:
+      # ----------------------------------------------------------------------
+      #  No warehouse here, so the dataset step is deliberately not run
+      # ----------------------------------------------------------------------
+      #  Registering the connection is writing a string. Registering a dataset
+      #  means asking ClickHouse what columns a mart has, because a
+      #  hand-written column list drifts the moment a model changes.
+      #
+      #  Only the three Superset services start here, so there is nothing to
+      #  ask and the step fails on name resolution:
+      #
+      #      Failed to resolve 'clickhouse-01' ...
+      #      Temporary failure in name resolution
+      #
+      #  Skipping it explicitly keeps the difference between "could not" and
+      #  "chose not to" visible. Wrapping it in `|| true` would hide a real
+      #  failure just as quietly.
+      # ----------------------------------------------------------------------
+      SUPERSET_SKIP_DATASETS: 1
+
     steps:
       - uses: actions/checkout@v5
 
@@ -59,7 +79,9 @@ jobs:
       # Only this stack's own .env. Nothing from the lower stacks is started,
       # so their files are never read.
       - name: Prepare .env
-        run: cp .env.example .env
+        run: |
+          cp .env.example .env
+          echo "SUPERSET_SKIP_DATASETS=1" >> .env
 
       # ----------------------------------------------------------------------
       #  Build before starting, not as part of starting
@@ -82,8 +104,6 @@ jobs:
       - name: Build the Superset image
         run: docker compose build superset-init
 
-      # PROFILES is empty so nothing from the included stacks starts. Only the
-      # three services this stack defines come up.
       - name: Start Superset, its database and Redis
         run: |
           for attempt in 1 2 3; do

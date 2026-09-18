@@ -83,22 +83,15 @@ services:
   # ==========================================================================
   #  One-shot: migrate, create the admin, register connection and datasets
   # ==========================================================================
-  #  Five steps that must run in order and must finish before the web process.
+  #  Four steps that must run in order and must finish before the web process.
   #
   #  `superset init` is the one people miss: it creates the default roles and
   #  permissions, and without it the UI loads, login succeeds, and every page
   #  is forbidden — an authenticated admin with rights to nothing.
   #
-  #  The connection and the datasets come last, because they need the schema
-  #  and the roles to exist. Both are registered on every start rather than
-  #  once: the operations are idempotent, so this costs nothing and means a
-  #  fresh volume comes back with the warehouse connected and its marts
-  #  already registered.
-  #
-  #  datasets.py runs through the venv's interpreter explicitly. `python`
-  #  alone resolves to it today and need not tomorrow, and the whole class of
-  #  failure this image has already produced is code running under the wrong
-  #  interpreter.
+  #  register.sh comes last, because it needs the schema and the roles. It is
+  #  idempotent, so running it on every start costs nothing and means a fresh
+  #  volume comes back with the warehouse connected and its marts registered.
   # ==========================================================================
   superset-init:
     build:
@@ -120,7 +113,7 @@ services:
       # rather than reading a path, so the directory goes on PYTHONPATH and
       # the file has to be named exactly this.
       PYTHONPATH: /app/pythonpath
-      # Read by provision.sh and datasets.py. The password never appears in a
+      # Read by register.sh and datasets.py. The password never appears in a
       # committed file.
       SUPERSET_CLICKHOUSE_NAME: ${SUPERSET_CLICKHOUSE_NAME}
       CLICKHOUSE_HOST: ${CLICKHOUSE_HOST}
@@ -128,9 +121,22 @@ services:
       CLICKHOUSE_USER: ${CLICKHOUSE_USER}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
       CLICKHOUSE_MARTS_DB: ${CLICKHOUSE_MARTS_DB}
+      # ----------------------------------------------------------------------
+      #  Skipping the dataset step where there is no warehouse
+      # ----------------------------------------------------------------------
+      #  Registering the connection is writing a string; registering a dataset
+      #  means asking ClickHouse what columns a mart has, because a
+      #  hand-written column list drifts the moment a model changes.
+      #
+      #  CI starts only the three Superset services, so there is nothing to
+      #  ask and the step fails on name resolution. Setting this to 1 there
+      #  makes it deliberately not run and say so — rather than wrapping it in
+      #  a `|| true` that would swallow a real failure just as quietly.
+      # ----------------------------------------------------------------------
+      SUPERSET_SKIP_DATASETS: ${SUPERSET_SKIP_DATASETS:-0}
     volumes: &superset-volumes
       - ./superset/superset_config.py:/app/pythonpath/superset_config.py:ro
-      - ./superset/provision.sh:/app/provision.sh:ro
+      - ./superset/register.sh:/app/register.sh:ro
       - ./superset/datasets.py:/app/datasets.py:ro
     command:
       - /bin/sh
@@ -144,8 +150,7 @@ services:
           --email "${SUPERSET_ADMIN_EMAIL}" \
           --password "${SUPERSET_ADMIN_PASSWORD}" || true
         superset init
-        sh /app/provision.sh
-        /app/.venv/bin/python /app/datasets.py
+        sh /app/register.sh
     depends_on:
       superset-postgres:
         condition: service_healthy
