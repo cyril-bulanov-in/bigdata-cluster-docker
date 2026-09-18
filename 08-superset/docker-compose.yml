@@ -196,6 +196,8 @@ services:
         condition: service_healthy
       superset-redis:
         condition: service_healthy
+      superset-statsd:
+        condition: service_healthy
 
   # ==========================================================================
   #  The web process
@@ -230,6 +232,12 @@ services:
     depends_on:
       superset-init:
         condition: service_completed_successfully
+      superset-postgres:
+        condition: service_healthy
+      superset-redis:
+        condition: service_healthy
+      superset-statsd:
+        condition: service_healthy
     healthcheck:
       # /health is served before Superset has finished loading its metadata,
       # so this says the process is alive rather than that the UI works. The

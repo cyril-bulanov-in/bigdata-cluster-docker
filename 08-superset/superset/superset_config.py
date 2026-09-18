@@ -107,11 +107,18 @@ EXPLORE_FORM_DATA_CACHE_CONFIG = {
 if env("SUPERSET_STATSD_ENABLED", "1") == "1":
     from superset.stats_logger import StatsdStatsLogger
 
-    STATS_LOGGER = StatsdStatsLogger(
-        host=env("SUPERSET_STATSD_HOST", "superset-statsd"),
-        port=int(env("SUPERSET_STATSD_PORT", "9125")),
-        prefix=env("SUPERSET_STATSD_PREFIX", "superset"),
-    )
+    try:
+        STATS_LOGGER = StatsdStatsLogger(
+            host=env("SUPERSET_STATSD_HOST", "superset-statsd"),
+            port=int(env("SUPERSET_STATSD_PORT", "9125")),
+            prefix=env("SUPERSET_STATSD_PREFIX", "superset"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "StatsD logger not configured (%s); metrics will not be emitted", exc
+        )
 
 # ---------------------------------------------------------------------------
 #  Features
