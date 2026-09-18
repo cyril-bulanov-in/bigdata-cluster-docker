@@ -1,12 +1,13 @@
-# Builds the Superset image and starts it with its metadata database and
-# Redis, without the rest of the platform.
+# Builds the Superset image and starts it with its metadata database, Redis
+# and its StatsD exporter — without the rest of the platform.
 #
 # Deliberately narrower than the lower workflows. Superset needs nothing from
 # Kafka, ClickHouse or Spark to prove it works: it needs its own Postgres, its
 # drivers, and its schema. Starting seven other stacks to reach those checks
 # would spend twenty minutes on nothing.
 #
-# What that costs is the datasets, which are read from the warehouse; see
+# What that costs is the datasets, the dashboard and the metric checks, all of
+# which need something this workflow does not start. They print as SKIP; see
 # "What continuous integration does not cover" in 08-superset/README.md.
 
 name: 08-superset
@@ -41,10 +42,10 @@ jobs:
       #  No warehouse here, so the dataset step is deliberately not run
       # ----------------------------------------------------------------------
       #  Registering the connection is writing a string. Registering a dataset
-      #  means asking ClickHouse what columns a mart has, because a
-      #  hand-written column list drifts the moment a model changes.
+      #  means asking ClickHouse what columns a mart has, and the dashboard
+      #  needs the datasets.
       #
-      #  Only the three Superset services start here, so there is nothing to
+      #  Only the four Superset services start here, so there is nothing to
       #  ask and the step fails on name resolution:
       #
       #      Failed to resolve 'clickhouse-01' ...
@@ -81,7 +82,7 @@ jobs:
       - name: Prepare .env
         run: |
           cp .env.example .env
-          echo "SUPERSET_SKIP_DATASETS=1" >> .env
+          sed -i 's/^SUPERSET_SKIP_DATASETS=.*/SUPERSET_SKIP_DATASETS=1/' .env
 
       # ----------------------------------------------------------------------
       #  Build before starting, not as part of starting
@@ -97,17 +98,22 @@ jobs:
       #  which reads as an authentication problem and is not. The same thing
       #  happened in step 6 with dataplatform/jmx-exporter.
       #
-      #  The build itself asserts that both drivers import from the venv
-      #  Superset runs from, so a driver installed into the wrong interpreter
-      #  fails here rather than minutes later in a different container.
+      #  The build asserts that all three drivers import from the venv
+      #  Superset runs from, so a package installed into the wrong interpreter
+      #  fails here rather than minutes later in a different container — which
+      #  is how psycopg2 and statsd were each missing in turn.
       # ----------------------------------------------------------------------
       - name: Build the Superset image
         run: docker compose build superset-init
 
-      - name: Start Superset, its database and Redis
+      # The exporter starts too. It needs nothing from the warehouse, and its
+      # absence would make the metric checks skip for the wrong reason.
+      - name: Start Superset, its database, Redis and the exporter
         run: |
           for attempt in 1 2 3; do
-            if docker compose up -d superset-postgres superset-redis superset-init superset; then
+            if docker compose up -d \
+                 superset-postgres superset-redis superset-statsd \
+                 superset-init superset; then
               echo "started on attempt ${attempt}"
               exit 0
             fi
@@ -130,9 +136,20 @@ jobs:
           free -h
           echo ""
           echo "=== drivers, from the venv Superset runs from ==="
+          # All three, and through that interpreter specifically. A package
+          # installed with the system pip lands outside the venv and is
+          # invisible to the application while plainly present on disk.
           docker run --rm --entrypoint /app/.venv/bin/python \
             dataplatform/superset:$(grep -E '^SUPERSET_VERSION=' .env | cut -d= -f2) \
-            -c "import psycopg2, clickhouse_connect; print(psycopg2.__version__, clickhouse_connect.__version__)" || true
+            -c "import psycopg2, clickhouse_connect, statsd; print('psycopg2', psycopg2.__version__, '| clickhouse-connect', clickhouse_connect.__version__, '| statsd', statsd.__version__)" || true
+          echo ""
+          echo "=== what the exporter is publishing ==="
+          # Superset emits over StatsD and serves no Prometheus endpoint, so
+          # this is the only place its metrics exist. An empty list means
+          # either nobody has used Superset yet or STATS_LOGGER is unset.
+          docker compose exec -T superset-statsd \
+            wget -qO- http://localhost:9102/metrics 2>/dev/null \
+            | grep -o '^superset_[a-z_]*' | sort -u | head -20 || true
           echo ""
           echo "=== superset-init, in full ==="
           docker compose logs --no-color superset-init || true
