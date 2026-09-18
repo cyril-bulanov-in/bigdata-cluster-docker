@@ -2,9 +2,9 @@
 #  PLATFORM — step 8: dashboards
 # ============================================================================
 #
-#  Superset with its own metadata database, a Redis for caching, and a
-#  connection to the warehouse registered from a script rather than clicked
-#  into the UI.
+#  Superset with its own metadata database, a Redis for caching, a connection
+#  to the warehouse and datasets over the dbt marts — all registered from
+#  files rather than clicked into the UI.
 #
 #  Start:  make up
 #  UI:     http://localhost:8089
@@ -81,18 +81,24 @@ services:
       start_period: 5s
 
   # ==========================================================================
-  #  One-shot: migrate, create the admin, register the connection
+  #  One-shot: migrate, create the admin, register connection and datasets
   # ==========================================================================
-  #  Four steps that must run in order and must finish before the web process.
+  #  Five steps that must run in order and must finish before the web process.
   #
   #  `superset init` is the one people miss: it creates the default roles and
   #  permissions, and without it the UI loads, login succeeds, and every page
   #  is forbidden — an authenticated admin with rights to nothing.
   #
-  #  The connection comes last, because it needs the schema and the roles to
-  #  exist. It is registered on every start rather than once: the command is
-  #  idempotent, so this costs nothing and means a fresh volume comes back
-  #  with the warehouse already connected.
+  #  The connection and the datasets come last, because they need the schema
+  #  and the roles to exist. Both are registered on every start rather than
+  #  once: the operations are idempotent, so this costs nothing and means a
+  #  fresh volume comes back with the warehouse connected and its marts
+  #  already registered.
+  #
+  #  datasets.py runs through the venv's interpreter explicitly. `python`
+  #  alone resolves to it today and need not tomorrow, and the whole class of
+  #  failure this image has already produced is code running under the wrong
+  #  interpreter.
   # ==========================================================================
   superset-init:
     build:
@@ -114,8 +120,8 @@ services:
       # rather than reading a path, so the directory goes on PYTHONPATH and
       # the file has to be named exactly this.
       PYTHONPATH: /app/pythonpath
-      # Read by provision.sh to assemble the connection URI. The password
-      # never appears in a committed file.
+      # Read by provision.sh and datasets.py. The password never appears in a
+      # committed file.
       SUPERSET_CLICKHOUSE_NAME: ${SUPERSET_CLICKHOUSE_NAME}
       CLICKHOUSE_HOST: ${CLICKHOUSE_HOST}
       CLICKHOUSE_PORT: ${CLICKHOUSE_PORT}
@@ -125,6 +131,7 @@ services:
     volumes: &superset-volumes
       - ./superset/superset_config.py:/app/pythonpath/superset_config.py:ro
       - ./superset/provision.sh:/app/provision.sh:ro
+      - ./superset/datasets.py:/app/datasets.py:ro
     command:
       - /bin/sh
       - -c
@@ -138,6 +145,7 @@ services:
           --password "${SUPERSET_ADMIN_PASSWORD}" || true
         superset init
         sh /app/provision.sh
+        /app/.venv/bin/python /app/datasets.py
     depends_on:
       superset-postgres:
         condition: service_healthy

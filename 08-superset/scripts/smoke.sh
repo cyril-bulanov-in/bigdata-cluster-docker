@@ -12,6 +12,9 @@
 #     and Superset fell back to its default
 #   the warehouse connection registered but pointing at the native port, which
 #     hangs rather than failing
+#   a dataset attached to a database that does not exist — the state the YAML
+#     import path produces silently, and the reason datasets.py looks the
+#     database up by name instead
 #   /health answering before the application has finished loading, which it
 #     does, so a healthy container proves less than it looks
 #
@@ -37,6 +40,8 @@ CH_MARTS="$(read_env CLICKHOUSE_MARTS_DB .env)";      CH_MARTS="${CH_MARTS:-mart
 
 IMAGE="dataplatform/superset:${SUPERSET_VERSION}"
 SUPERSET="http://localhost:${SUPERSET_PORT}"
+
+EXPECTED_DATASETS="daily_sales_by_category customer_order_summary recon_orders_by_source"
 
 # The virtualenv Superset actually runs from. Not a detail: a package
 # installed with the system pip lands outside it and is invisible to the
@@ -68,9 +73,6 @@ else
   exit 1
 fi
 
-# Imported through the venv's interpreter explicitly. `python -c` alone would
-# use whatever is first on the path — and the whole class of failure this
-# guards against is a package reachable from one interpreter and not the other.
 for mod in psycopg2 clickhouse_connect; do
   if docker run --rm --entrypoint "$VENV_PY" "$IMAGE" -c "import ${mod}" >/dev/null 2>&1; then
     pass "${mod} is importable from ${VENV_PY}"
@@ -79,10 +81,6 @@ for mod in psycopg2 clickhouse_connect; do
   fi
 done
 
-# Importable is not the same as registered. Superset asks SQLAlchemy for a
-# `clickhousedb://` dialect, and a driver that imports cleanly while failing
-# to register produces an error about an unknown dialect when the connection
-# is used — several steps away from the cause.
 if docker run --rm --entrypoint "$VENV_PY" "$IMAGE" -c \
      "import clickhouse_connect.cc_sqlalchemy" >/dev/null 2>&1; then
   pass "the clickhousedb:// dialect registers"
@@ -127,8 +125,6 @@ tables=$(pg "SELECT count(*) FROM information_schema.tables WHERE table_schema =
   && pass "${tables} tables in Postgres — the migration ran against the right database" \
   || fail "${tables:-0} tables in Postgres, expected at least 20 — did Superset fall back to SQLite?"
 
-# `superset init` creates the default roles. Without it the UI loads, login
-# succeeds, and every page is forbidden.
 roles=$(pg "SELECT count(*) FROM ab_role")
 [ "${roles:-0}" -ge 4 ] 2>/dev/null \
   && pass "${roles} roles exist — superset init ran" \
@@ -142,10 +138,6 @@ admins=$(pg "SELECT count(*) FROM ab_user WHERE username = '${ADMIN_USER}'")
 # ---------------------------------------------------------------------------
 #  4. The warehouse connection
 # ---------------------------------------------------------------------------
-#  Registered by provision.sh on every start, so a fresh volume comes back
-#  with it rather than waiting for someone to click it in. A connection that
-#  exists only in a browser is not part of the project.
-# ---------------------------------------------------------------------------
 info "The warehouse connection"
 
 conn_count=$(pg "SELECT count(*) FROM dbs WHERE database_name = '${CH_NAME}'")
@@ -154,16 +146,15 @@ conn_count=$(pg "SELECT count(*) FROM dbs WHERE database_name = '${CH_NAME}'")
   || fail "no connection named '${CH_NAME}' — check: docker compose logs superset-init"
 
 if [ "${conn_count:-0}" -ge 1 ]; then
-  # The URI itself, checked for the two things easy to get wrong: the dialect
-  # and the port. clickhouse-connect speaks HTTP on 8123; pointed at the
-  # native 9000 it hangs rather than failing, because that port accepts the
-  # connection and then waits for bytes that never make sense.
   uri=$(pg "SELECT sqlalchemy_uri FROM dbs WHERE database_name = '${CH_NAME}' LIMIT 1")
 
   printf '%s' "$uri" | grep -q '^clickhousedb://' \
     && pass "it uses the clickhousedb:// dialect" \
     || fail "the URI is '${uri:-empty}' — expected clickhousedb://"
 
+  # clickhouse-connect speaks HTTP on 8123. Pointed at the native 9000 it
+  # hangs rather than failing, because that port accepts the connection and
+  # then waits for bytes that never make sense.
   printf '%s' "$uri" | grep -q ':8123/' \
     && pass "it points at the HTTP port" \
     || fail "the URI does not use port 8123 — the native port hangs rather than failing"
@@ -173,10 +164,53 @@ if [ "${conn_count:-0}" -ge 1 ]; then
     || fail "the URI does not end in /${CH_MARTS}"
 fi
 
-# ---- does it actually work -------------------------------------------------
-#  Registered is not the same as usable. Skipped rather than failed when the
-#  warehouse is absent: this stack is startable without it, and CI runs that
-#  way.
+# ---------------------------------------------------------------------------
+#  5. The datasets
+# ---------------------------------------------------------------------------
+#  Registered by datasets.py on every start, so a fresh volume comes back with
+#  them. A dataset created in the UI is not part of the project and does not
+#  survive `make clean`.
+#
+#  The dangling-dataset check is the one worth having. Superset's documented
+#  YAML import links a dataset to its database by UUID, and a bundle exported
+#  from one installation points at a UUID that does not exist in another — the
+#  import succeeds and produces datasets attached to nothing, which shows up
+#  only when someone opens a chart.
+# ---------------------------------------------------------------------------
+info "The datasets"
+
+for ds in $EXPECTED_DATASETS; do
+  n=$(pg "SELECT count(*) FROM tables WHERE table_name = '${ds}'")
+  [ "${n:-0}" -ge 1 ] 2>/dev/null \
+    && pass "dataset ${ds} is registered" \
+    || fail "dataset ${ds} is missing — check: docker compose logs superset-init"
+done
+
+# Every dataset must point at a database that exists.
+dangling=$(pg "SELECT count(*) FROM tables t LEFT JOIN dbs d ON d.id = t.database_id WHERE d.id IS NULL")
+[ "${dangling:-1}" = "0" ] \
+  && pass "no dataset points at a missing database" \
+  || fail "${dangling} dataset(s) attached to a database that does not exist"
+
+# Columns are fetched from ClickHouse rather than declared, so a dataset with
+# none means fetch_metadata() failed quietly — the dataset exists and every
+# chart built on it will have nothing to select.
+for ds in $EXPECTED_DATASETS; do
+  cols=$(pg "SELECT count(*) FROM table_columns c JOIN tables t ON t.id = c.table_id WHERE t.table_name = '${ds}'")
+  [ "${cols:-0}" -ge 3 ] 2>/dev/null \
+    && pass "${ds} has ${cols} columns" \
+    || fail "${ds} has ${cols:-0} columns — fetch_metadata() found nothing"
+done
+
+# Metrics defined on the dataset rather than in individual charts. Two charts
+# that each define "revenue" will eventually disagree; one definition on the
+# dataset is inherited by every chart.
+metrics=$(pg "SELECT count(*) FROM sql_metrics m JOIN tables t ON t.id = m.table_id WHERE t.table_name IN ('daily_sales_by_category','customer_order_summary','recon_orders_by_source')")
+[ "${metrics:-0}" -ge 9 ] 2>/dev/null \
+  && pass "${metrics} metrics defined on the datasets" \
+  || fail "${metrics:-0} metrics, expected at least 9"
+
+# ---- does the connection actually work -------------------------------------
 if ! docker ps --format '{{.Names}}' | grep -qx clickhouse-01; then
   skip "querying the warehouse — ClickHouse is not running"
   skip "the marts are visible — ClickHouse is not running"
@@ -200,8 +234,6 @@ with app.app_context():
     && pass "a query through the stored connection returns" \
     || fail "querying through the connection failed: ${query_out:-no output}"
 
-  # The marts dbt built. Absent means the connection works and points at an
-  # empty database, which is a different problem from a broken connection.
   marts=$($COMPOSE exec -T clickhouse-01 clickhouse-client \
     --query "SELECT count() FROM system.tables WHERE database = '${CH_MARTS}'" 2>/dev/null | tr -d '\r' || true)
   [ "${marts:-0}" -ge 3 ] 2>/dev/null \
@@ -210,7 +242,7 @@ with app.app_context():
 fi
 
 # ---------------------------------------------------------------------------
-#  5. The application
+#  6. The application
 # ---------------------------------------------------------------------------
 info "The application (waiting up to ${UI_TIMEOUT}s)"
 
@@ -237,7 +269,7 @@ printf '%s' "$version_out" | grep -q "${SUPERSET_VERSION%%.*}" \
   || fail "Superset did not report version ${SUPERSET_VERSION}: ${version_out:-nothing}"
 
 # ---------------------------------------------------------------------------
-#  6. Caching
+#  7. Caching
 # ---------------------------------------------------------------------------
 info "Caching"
 
@@ -245,8 +277,6 @@ $COMPOSE exec -T superset-redis redis-cli ping 2>/dev/null | grep -qi pong \
   && pass "Redis answers" \
   || fail "Redis does not answer"
 
-# Read from the running application rather than from the file: a config that
-# failed to import leaves Superset running on its defaults, silently.
 cache_type=$(sup "$VENV_PY" -c \
   "from superset.app import create_app; a=create_app(); print(a.config['FILTER_STATE_CACHE_CONFIG']['CACHE_TYPE'])")
 printf '%s' "$cache_type" | grep -qi 'redis' \
